@@ -264,6 +264,33 @@ class DocumentTests(unittest.TestCase):
             otl_write.commit_document("f", prepared, mode="replace", baseline=[old],
                                       progress=lambda _: None)
 
+    def test_airpage_keeps_original_heading_numbers(self):
+        md = "## 4.1 概述\n\n正文里的 4.1 不动\n\n### 4.1.1 细节\n\n## 前言"
+        masked, count = otl_write.mask_heading_numbers(md)
+        self.assertEqual(count, 2)
+        self.assertIn("## \u20634.1 概述", masked)
+        self.assertIn("正文里的 4.1 不动", masked)
+        self.assertIn("\n## 前言", masked)
+
+        blocks = [{"heading": {"block_id": "h", "elements": [
+            {"text": {"attributes": {"content": "\u20634.1 概述"}}}]}},
+            {"paragraph": {"block_id": "p", "elements": [
+                {"text": {"attributes": {"content": "\u2063正文"}}}]}}]
+        self.assertEqual(otl_write.unmask_headings(blocks), 1)
+        self.assertEqual(blocks[0]["heading"]["elements"][0]["text"]["attributes"]["content"], "4.1 概述")
+        self.assertEqual(blocks[1]["paragraph"]["elements"][0]["text"]["attributes"]["content"], "\u2063正文")
+
+    def test_airpage_prepare_masks_headings_only_for_convert(self):
+        heading = {"heading": {"block_id": "h", "elements": [
+            {"text": {"attributes": {"content": "\u20634.1 概述"}}}], "attributes": {"level": 2}}}
+        with (patch.object(otl_write, "api", return_value={"blocks": [heading]}) as api,
+              patch.object(otl_write, "image_plan", return_value=[])):
+            prepared = otl_write.prepare_markdown("f", "## 4.1 概述\n", images="off",
+                                                  progress=lambda _: None)
+        self.assertIn("\u20634.1 概述", api.call_args.args[2]["content"])
+        self.assertEqual(
+            prepared["children"][0]["heading"]["elements"][0]["text"]["attributes"]["content"], "4.1 概述")
+
     def test_airpage_delete_range_rejects_empty_range(self):
         with self.assertRaises(ValueError):
             otl_write.delete_range("f", 3, 3, 5)

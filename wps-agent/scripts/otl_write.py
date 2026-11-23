@@ -32,6 +32,12 @@ DOC_WIDTH = 740             # 正文默认宽度（px），86% ≈ 636
 DEFAULT_IMG_PCT = 86
 #: `<img src="...">` 与 `![alt](...)`，按出现顺序 —— 与 convert 出的 picture 块一一对应。
 IMAGE_RE = re.compile(r'<img[^>]*?\bsrc="([^"]+)"|!\[[^\]]*\]\(([^)\s]+)\)', re.IGNORECASE)
+#: 编号标题，如 `## 4.1 概述`。convert 会把它当成自动编号，把编号从文本里吃掉，
+#: 编号变成重组后的 1、2、3…；改写原文编号才能对上正文里的「按 4.1 执行」。
+#: 加粗、行内代码、去空格、反斜杠转义、HTML 实体都试过，转换前都会被还原成数字开头。
+HEADING_NUMBER_RE = re.compile(r"^(#{1,6}[ \t]+)(\d+(?:\.\d+)*)(?=[ \t]|$)")
+#: 挡住行首的不可见字符（U+2063 INVISIBLE SEPARATOR）。转换后抹掉，标题文本与原文一致。
+HEADING_MASK = "\u2063"
 
 
 def api(method: str, path: str, data: dict | None, timeout: int,
@@ -527,17 +533,62 @@ def file_digest(path: str) -> str:
     return digest.hexdigest()
 
 
+def mask_heading_numbers(md: str) -> tuple[str, int]:
+    """在编号标题的行首插入不可见占位符，返回（新 Markdown, 处理条数）。
+
+    WPS 的 Markdown 转换把 `## 4.1 概述` 当成自动编号：编号从文本里消失，标题改成
+    重组后的 1、2、3…。行首多一个不可见字符后不再命中该规则，转换后抹掉即得原文。
+    """
+    lines: list[str] = []
+    masked = 0
+    for line in md.splitlines():
+        match = HEADING_NUMBER_RE.match(line)
+        if match:
+            head = match.group(1)
+            line = head + HEADING_MASK + line[len(head):]
+            masked += 1
+        lines.append(line)
+    return "\n".join(lines), masked
+
+
+def unmask_headings(blocks: list) -> int:
+    """抹掉标题文本里的占位符，返回还原的标题数。"""
+    restored = 0
+    for block in blocks:
+        if not (isinstance(block, dict) and isinstance(block.get("heading"), dict)):
+            continue
+        hit = False
+        for element in block["heading"].get("elements") or []:
+            text = element.get("text")
+            if not isinstance(text, dict):
+                continue
+            attributes = text.get("attributes") or {}
+            content = attributes.get("content")
+            if isinstance(content, str) and HEADING_MASK in content:
+                attributes["content"] = content.replace(HEADING_MASK, "")
+                hit = True
+        restored += 1 if hit else 0
+    return restored
+
+
 def prepare_markdown(file_id: str, md: str, *, base: str = ".",
                      timeout: int = 180, dry_run: bool = False,
                      images: str = "auto", img_pct: int = DEFAULT_IMG_PCT,
                      doc_width: int = DOC_WIDTH, progress=print) -> dict:
     """Prepare all blocks before editing the document body."""
     plan = image_plan(md, base) if images != "off" else []
+    masked_md, masked = mask_heading_numbers(md)
     converted = api("post", f"/v7/airpage/v2/{_wps.segment(file_id)}/blocks/convert",
-                    {"format": "markdown", "content": md}, timeout)
+                    {"format": "markdown", "content": masked_md}, timeout)
     blocks = converted.get("blocks") or []
     if not blocks:
         sys.exit("[otl_write] 转换结果为空，未写入任何内容")
+    if masked:
+        restored = unmask_headings(blocks)
+        if restored != masked:
+            sys.exit(f"[otl_write] 标题编号占位符未完全还原（{restored}/{masked}），已停止；"
+                     "未写入任何内容")
+        progress(f"标题编号：{masked} 个按原文保留，不转成自动编号")
 
     kinds: dict[str, int] = {}
     for block in blocks:
