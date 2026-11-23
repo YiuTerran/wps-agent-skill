@@ -1,4 +1,5 @@
 import contextlib
+import gzip
 import hashlib
 import io
 import json
@@ -160,6 +161,42 @@ class ClientTests(unittest.TestCase):
         self.assertIsNone(other.get_header("Authorization"))
         self.assertEqual(other.get_header("X-signed"), "signed")
 
+    def test_gzip_encoded_response_is_decoded(self):
+        payload = {"code": 0, "data": {"blocks": []}}
+        response = io.BytesIO(gzip.compress(json.dumps(payload).encode()))
+        response.status = 200
+        response.headers = Message()
+        response.headers["Content-Encoding"] = "gzip"
+        self.opener.open.side_effect = [auth_response(), response]
+        with patch.dict(os.environ, {"AGENT_API_KEY": "test-key"}):
+            self.assertEqual(self.client.api("POST", "/v7/airpage/v2/doc/blocks",
+                                             body={"block_id": "doc"}, read_only=True),
+                             {"blocks": []})
+
+    def test_truncated_gzip_body_still_reports_unparseable(self):
+        response = io.BytesIO(b"\x1f\x8b\x08\x00broken")
+        response.status = 200
+        response.headers = Message()
+        response.headers["Content-Encoding"] = "gzip"
+        self.opener.open.side_effect = [auth_response(), response]
+        with patch.dict(os.environ, {"AGENT_API_KEY": "test-key"}):
+            with self.assertRaisesRegex(_wps.WpsError, "响应无法解析"):
+                self.client.api("GET", "/v7/airpage/v2/doc/blocks")
+
+    def test_transient_read_failure_is_retried_but_write_is_not(self):
+        with (patch.dict(os.environ, {"AGENT_API_KEY": "test-key"}),
+              patch.object(_wps.time, "sleep") as sleep):
+            self.opener.open.side_effect = [auth_response(), urllib.error.URLError("reset"),
+                                            api_response({"ok": True})]
+            self.assertEqual(self.client.api("GET", "/v7/airpage/v2/doc/blocks"), {"ok": True})
+            self.assertEqual(self.opener.open.call_count, 3)
+            sleep.assert_called()
+            self.opener.open.reset_mock()
+            self.opener.open.side_effect = [urllib.error.URLError("reset")]
+            with self.assertRaisesRegex(_wps.WpsError, "网络请求失败或超时"):
+                self.client.api("POST", "/v7/airpage/v2/doc/blocks", body={"block_id": "doc"})
+        self.opener.open.assert_called_once()
+
     def test_redirect_and_unapproved_hosts_are_not_followed(self):
         handler = _wps.NoRedirect()
         for status in (301, 302, 307, 308):
@@ -216,6 +253,28 @@ class DocumentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "超出"):
                 otl_write.image_plan("![外部文件](../secret.png)", directory)
+
+    def test_airpage_replace_reports_leftover_range_when_readback_fails(self):
+        old = {"paragraph": {"block_id": "old", "elements": [{"text": {"attributes": {"content": "旧"}}}]}}
+        prepared = {"file_id": "f", "children": [], "dry_run": False, "written": 0}
+        with (patch.object(otl_write, "doc_children",
+                           side_effect=[[old], [old], _wps.WpsError("读取", "响应无法解析")]),
+              patch.object(otl_write, "api", return_value={}),
+              self.assertRaisesRegex(SystemExit, "--delete-range 0:1")):
+            otl_write.commit_document("f", prepared, mode="replace", baseline=[old],
+                                      progress=lambda _: None)
+
+    def test_airpage_delete_range_rejects_empty_range(self):
+        with self.assertRaises(ValueError):
+            otl_write.delete_range("f", 3, 3, 5)
+
+    def test_airpage_delete_range_deletes_then_recounts(self):
+        with (patch.object(otl_write, "api") as api,
+              patch.object(otl_write, "doc_children", return_value=[]) as read):
+            otl_write.delete_range("f", 2, 5, 5)
+        api.assert_called_once()
+        self.assertEqual(api.call_args.args[2], {"block_id": "doc", "start_index": 2, "end_index": 5})
+        read.assert_called_once()
 
     def test_office_rechecks_before_commit(self):
         with tempfile.TemporaryDirectory() as directory:

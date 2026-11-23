@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import http.client
 import json
@@ -13,12 +14,15 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from pathlib import Path
 
 
 TOKEN_URL = "https://account.wps.cn/api/authorization/agent/v1/token"
 API_ORIGIN = "https://openapi.wps.cn"
 CONTENT_ORIGIN = "https://api.wps.cn"
+READ_ATTEMPTS = 3          # 只读请求的重试次数（幂等，可安全重放）
+MAX_RETRY_TIMEOUT = 900    # 重试时的单次超时上限（秒）
 LINK_HOSTS = {"www.kdocs.cn", "kdocs.cn", "365.kdocs.cn", "weboffice.wps.cn"}
 _SHELL_ASSIGNMENT = re.compile(r"[ \t]*(?:export[ \t]+)?AGENT_API_KEY=(.*)")
 _SHELL_LITERAL = re.compile(r"""(['"]?)([A-Za-z0-9._:/+=@%-]+)\1(?:[ \t]+#.*)?[ \t]*""")
@@ -97,6 +101,34 @@ def _http_kind(status, code):
 
 def _encode(body):
     return json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def _decode_body(response) -> bytes:
+    """读取响应体并按 Content-Encoding 解压。
+
+    大正文（数千块）的 blocks 响应会被网关 gzip 压缩，即便请求没写 Accept-Encoding。
+    urllib 不会自动解压，直接 json.load 会得到「响应无法解析，HTTP 200」这种假故障。
+    截断的压缩流解不开时交回原始字节，让上层按解析失败处理。
+    """
+    raw = response.read()
+    encoding = (response.headers.get("Content-Encoding") or "").strip().lower()
+    if encoding == "gzip" or (not encoding and raw[:2] == b"\x1f\x8b"):
+        try:
+            return gzip.decompress(raw)
+        except (OSError, EOFError):
+            return raw
+    if encoding == "deflate":
+        for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+            try:
+                return zlib.decompress(raw, wbits)
+            except zlib.error:
+                continue
+    return raw
+
+
+def _transient(exc: "WpsError") -> bool:
+    """读请求是否值得重试：网络中断、超时、响应截断或网关临时错误。"""
+    return exc.status is None or exc.status in {408, 425, 429, 500, 502, 503, 504}
 
 
 def _config_path() -> Path:
@@ -188,15 +220,15 @@ class Client:
             raise WpsError(operation, kind, uncertain=write) from None
 
     def _json(self, url, method, timeout, operation, *, headers=None, body=None, write=False):
-        headers = {"Accept": "application/json", **(headers or {})}
+        headers = {"Accept": "application/json", "Accept-Encoding": "gzip", **(headers or {})}
         if body is not None:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, method=method, headers=headers,
                                          data=_encode(body) if body is not None else None)
         with self._open(request, timeout, operation, write=write, json_errors=True) as response:
             try:
-                payload = json.load(response)
-            except (ValueError, OSError, http.client.HTTPException):
+                payload = json.loads(_decode_body(response).decode("utf-8"))
+            except (ValueError, OSError, http.client.HTTPException, zlib.error):
                 kind = "响应无法解析"
                 if write:
                     kind += "，请先回读确认写入结果"
@@ -234,10 +266,13 @@ class Client:
             raise ValueError("备用网关只用于正文读取")
         read_only = read_only or method == "GET"
         url = origin + path + ("?" + urllib.parse.urlencode(query, doseq=True) if query else "")
-        for attempt in range(2):
+        # 读请求幂等，大正文的块树读取容易被网关超时截断，放宽重试次数并逐次延长超时
+        attempts = READ_ATTEMPTS if read_only else 2
+        for attempt in range(attempts):
             token = self._access_token(timeout)
+            call_timeout = timeout if attempt == 0 else min(timeout * (attempt + 1), MAX_RETRY_TIMEOUT)
             try:
-                payload, status, headers = self._json(url, method, timeout, operation,
+                payload, status, headers = self._json(url, method, call_timeout, operation,
                     headers={"Authorization": f"Bearer {token}"}, body=body, write=not read_only)
                 code = _numeric_code(payload)
                 if code != 0:
@@ -248,9 +283,13 @@ class Client:
                     raise WpsError(operation, kind, status=status, code=code, headers=headers, uncertain=uncertain)
                 return payload.get("data") if payload.get("data") is not None else {}
             except WpsError as exc:
-                if not (read_only and attempt == 0 and (exc.status == 401 or exc.code in {401, 401000001})):
-                    raise
-                self._token = None
+                if read_only and attempt == 0 and (exc.status == 401 or exc.code in {401, 401000001}):
+                    self._token = None
+                    continue
+                if read_only and attempt + 1 < attempts and _transient(exc):
+                    time.sleep(min(2 ** attempt, 5))
+                    continue
+                raise
 
     def transfer(self, url, method, *, timeout, headers=None, data=None, operation="文件传输"):
         parsed = urllib.parse.urlsplit(url)

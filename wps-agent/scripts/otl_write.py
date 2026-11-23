@@ -67,6 +67,43 @@ def backup_blocks(file_id: str, blocks: list) -> None:
         print(f"正文块备份：{handle.name}")
 
 
+def block_preview(block: dict, limit: int = 30) -> str:
+    """一级块的开头文字，用于人工确认块树位置。"""
+    kind = next(iter(block), "")
+    node = block.get(kind) or {}
+    if kind in {"paragraph", "heading", "blockquote"}:
+        text = "".join((element.get("text") or {}).get("attributes", {}).get("content", "")
+                       for element in node.get("elements") or [])
+        return text[:limit]
+    if kind == "table":
+        return f"<table {len(node.get('rows') or [])} 行>"
+    return f"<{kind}>"
+
+
+def describe_children(children: list, progress=print) -> None:
+    """打印块树概况：总数、类型分布、首末块 —— 导出接口有缓存，不能用它判断写入结果。"""
+    kinds: dict[str, int] = {}
+    for block in children:
+        kind = next(iter(block), "")
+        kinds[kind] = kinds.get(kind, 0) + 1
+    detail = " / ".join(f"{kind} {count}" for kind, count in sorted(kinds.items(), key=lambda item: -item[1]))
+    progress(f"一级块 {len(children)} 个（{detail or '空'}）")
+    if children:
+        progress(f"  首块 {block_preview(children[0])!r}　末块 {block_preview(children[-1])!r}")
+
+
+def delete_range(file_id: str, start: int, end: int, timeout: int) -> list:
+    """按一级块索引区间删除，用于清理 replace 之后残留的原块。"""
+    if not 0 <= start < end:
+        raise ValueError("区间需满足 0 ≤ START < END")
+    api("post", f"/v7/airpage/v2/{_wps.segment(file_id)}/blocks/delete",
+        {"block_id": "doc", "start_index": start, "end_index": end}, timeout)
+    print(f"已删除一级块区间 [{start}, {end})")
+    children = doc_children(file_id, timeout)
+    describe_children(children)
+    return children
+
+
 def strip_front_matter(md: str) -> tuple[str, dict]:
     """摘掉文首的 YAML front matter（返回 正文, 元数据）。
 
@@ -608,7 +645,11 @@ def write_prepared(file_id: str, prepared: dict, *, index: int = 0,
             if not exc.uncertain:
                 raise
             progress("写入响应异常，正在读取云端块确认结果")
-        current = doc_children(file_id, timeout)
+        try:
+            current = doc_children(file_id, timeout)
+        except _wps.WpsError as exc:
+            sys.exit(f"[otl_write] 已写入 {written}/{len(blocks)} 个块，随后读取块树失败：{exc}\n"
+                     f"请用 --count-blocks 确认云端块数，再决定重写还是继续")
         saved = current[offset:offset + len(piece)]
         if (content_signature(saved) != content_signature(piece)
                 or any(not _block_id(block) or _block_id(block) in known for block in saved)):
@@ -640,10 +681,15 @@ def commit_document(file_id: str, prepared: dict, *, mode: str,
     # Verify the replacement first. Remove only the original contiguous block range.
     start = stats["written"]
     end = start + len(current)
-    latest = doc_children(file_id, timeout)
+    try:
+        latest = doc_children(file_id, timeout)
+    except _wps.WpsError as exc:
+        sys.exit(f"[otl_write] 新正文已写入 {start} 个块，但回读失败，旧正文尚未清理：{exc}\n"
+                 f"请稍后用 --count-blocks 确认块数，必要时执行 --delete-range {start}:{end} 清理原块")
     if (body_fingerprint(latest[start:end]) != body_fingerprint(current)
             or content_signature(latest[:start]) != content_signature(prepared["children"])):
-        sys.exit("[otl_write] 新正文已写入，原块范围有变化。请读回确认，旧正文尚未清理")
+        sys.exit(f"[otl_write] 新正文已写入 {start} 个块，原块范围有变化，旧正文尚未清理。"
+                 f"请读回确认后按需执行 --delete-range {start}:{end}")
     try:
         api("post", f"/v7/airpage/v2/{_wps.segment(file_id)}/blocks/delete",
             {"block_id": "doc", "start_index": start, "end_index": end}, timeout)
@@ -651,7 +697,11 @@ def commit_document(file_id: str, prepared: dict, *, mode: str,
         if not exc.uncertain:
             raise
         progress("删除响应异常，正在回查原块")
-    saved = doc_children(file_id, timeout)
+    try:
+        saved = doc_children(file_id, timeout)
+    except _wps.WpsError as exc:
+        sys.exit(f"[otl_write] 新正文已写入 {start} 个块，但回读失败，旧正文可能仍在文档末尾：{exc}\n"
+                 f"请稍后用 --count-blocks 确认块数，必要时执行 --delete-range {start}:{end} 清理原块")
     original_ids = {_block_id(block) for block in current}
     if (original_ids.intersection(_block_id(block) for block in saved)
             or content_signature(saved[:start]) != content_signature(prepared["children"])):
@@ -722,7 +772,23 @@ def main() -> None:
     ap.add_argument("--allow-added", action="store_true",
                     help="仅「新增块」不算冲突（未声明 scope 时的宽松档）")
     ap.add_argument("--force", action="store_true", help="忽略冲突检查，强制写入")
+    ap.add_argument("--count-blocks", action="store_true",
+                    help="只统计当前一级块数量与类型分布后退出（导出接口有缓存，用它核对写入结果）")
+    ap.add_argument("--delete-range", metavar="START:END",
+                    help="删除一级块区间 [START, END) 后退出；用于清理 replace 中断后残留的原块")
     args = ap.parse_args()
+
+    if args.count_blocks:
+        describe_children(doc_children(args.file_id, args.timeout))
+        return
+
+    if args.delete_range:
+        try:
+            start, end = (int(part) for part in args.delete_range.split(":", 1))
+        except ValueError:
+            ap.error("--delete-range 需要 START:END，例如 1710:3417")
+        delete_range(args.file_id, start, end, args.timeout)
+        return
 
     if args.list_blocks:
         list_blocks(args.file_id, args.timeout)
