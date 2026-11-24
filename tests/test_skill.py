@@ -325,6 +325,67 @@ class DocumentTests(unittest.TestCase):
         otl_write.check_html_tables("<table><tbody><tr><td>甲</td></tr></tbody></table>\n")
         otl_write.check_html_tables("```html\n<table><tr><td>示例</td></tr></table>\n```\n")
 
+    @staticmethod
+    def _aria_cell(text, colspan=1, rowspan=1, extra=None):
+        elements = [{"text": {"attributes": {"content": text}}}]
+        if extra:
+            elements.append({"text": {"attributes": {"content": extra}}})
+        return {"attributes": {"colspan": colspan, "rowspan": rowspan},
+                "children": [{"paragraph": {"attributes": {"align": "left"}, "elements": elements}}]}
+
+    def test_airpage_merged_cell_width_counts_on_first_column(self):
+        header = self._aria_cell("一级和二级分类代码与名称说明", colspan=2)
+        table = {"table": {"attributes": {"grid": [200, 116, 116]},
+                           "rows": [{"cells": [header, self._aria_cell("代码", rowspan=2)]}]}}
+        natural, baseline, _ = otl_write._column_metrics(table["table"])
+        self.assertEqual(natural[1], otl_write.TABLE_MIN_COL)
+        self.assertGreater(natural[0], 200)
+        self.assertEqual(baseline[0], natural[0])
+        self.assertEqual(baseline[1], otl_write.TABLE_MIN_COL)
+
+    def test_airpage_plan_widths_follows_content_volume(self):
+        widths = otl_write._plan_widths([10.0, 100.0, 5.0], [116, 116, 116], 740)
+        self.assertEqual(sum(widths), 740)
+        self.assertTrue(all(width >= otl_write.TABLE_MIN_COL for width in widths))
+        self.assertGreater(widths[1], widths[0])
+        # 开方分配，长列拿不到全部剩余宽度，短列不至于被挤成竖排
+        self.assertLess(widths[1], 740 - 2 * otl_write.TABLE_MIN_COL)
+        self.assertIsNone(otl_write._plan_widths([1.0] * 10, [116] * 10, 740))
+
+    def test_airpage_split_text_prefers_punctuation(self):
+        pieces = otl_write._split_text("一二三四五，六七三四五八九十", 6)
+        self.assertEqual(pieces[0], "一二三四五，")
+        self.assertTrue(all(len(piece) <= 6 for piece in pieces))
+
+    def test_airpage_reflows_wide_tables_to_body_width(self):
+        long = "用于存储测站的基本属性信息其中包括测站编码测站名称河流名称"
+        table = {"table": {"attributes": {"grid": [500, 500]}, "rows": [
+            {"cells": [self._aria_cell("说明"), self._aria_cell("备注")]},
+            {"cells": [self._aria_cell(long), self._aria_cell(long)]}]}}
+        self.assertEqual(otl_write.reflow_tables([table], 740), 1)
+        attributes = table["table"]["attributes"]
+        self.assertEqual(sum(attributes["grid"]), 740)
+        self.assertEqual(attributes["width"], 740)
+        for cell, width in zip(table["table"]["rows"][1]["cells"], attributes["grid"]):
+            lines = otl_write._cell_paragraphs(cell)
+            self.assertGreater(len(lines), 1)
+            self.assertLessEqual(max(len(line) for line in lines), otl_write._chars_for_width(width))
+
+    def test_airpage_reflow_skips_tables_within_tolerance(self):
+        table = {"table": {"attributes": {"grid": [380, 380]}, "rows": [
+            {"cells": [self._aria_cell("说明"), self._aria_cell("备注")]},
+            {"cells": [self._aria_cell("测站名"), self._aria_cell("测站名")]}]}}
+        self.assertEqual(otl_write.reflow_tables([table], 740), 0)
+        self.assertEqual(table["table"]["attributes"]["grid"], [380, 380])
+
+    def test_airpage_reflow_leaves_rich_text_cells(self):
+        cell = self._aria_cell("测站名称" * 10, extra="（加粗）")
+        table = {"table": {"attributes": {"grid": [500, 500]}, "rows": [
+            {"cells": [self._aria_cell("说明"), self._aria_cell("备注")]},
+            {"cells": [self._aria_cell("测站名称" * 10), cell]}]}}
+        otl_write.reflow_tables([table], 740)
+        self.assertEqual(len(cell["children"]), 1)
+
     def test_airpage_table_width_zero_keeps_grid(self):
         block = {"table": {"attributes": {"grid": [800, 800]}, "rows": [{"cells": []}]}}
         self.assertEqual(otl_write.fit_table_widths([block], 0), (0, 0))

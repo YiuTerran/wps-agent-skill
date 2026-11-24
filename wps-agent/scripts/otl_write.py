@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -35,6 +36,8 @@ TABLE_MIN_COL = 116
 #: 内容超过 BASE 个字后，每多一个字列宽下限增加约这么多（实测 9 字 180、13 字 244）。
 TABLE_COL_PER_CHAR = 16
 TABLE_COL_BASE_CHARS = 5
+#: 允许的溢出比例：超出不到这个比例的表不动，切行会白白增加行高。
+TABLE_OVERFLOW_TOLERANCE = 0.05
 DEFAULT_IMG_PCT = 86
 #: `<img src="...">` 与 `![alt](...)`，按出现顺序 —— 与 convert 出的 picture 块一一对应。
 IMAGE_RE = re.compile(r'<img[^>]*?\bsrc="([^"]+)"|!\[[^\]]*\]\(([^)\s]+)\)', re.IGNORECASE)
@@ -493,26 +496,29 @@ def fill_pictures(blocks: list, plan: list[dict], img_pct: int, doc_width: int,
 
 # ---------------------------------------------------------------- 超长表格
 
-def _cell_text(cell) -> str:
-    """按顺序取出单元格里的所有文本，用于估算列宽下限。"""
-    out: list[str] = []
-
-    def walk(node) -> None:
-        if isinstance(node, dict):
-            text = node.get("text")
-            if isinstance(text, dict):
-                content = (text.get("attributes") or {}).get("content")
-                if isinstance(content, str):
-                    out.append(content)
-            for key, value in node.items():
-                if key != "text" and isinstance(value, (dict, list)):
-                    walk(value)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk((cell or {}).get("children") or [])
+def _paragraph_text(paragraph) -> str:
+    """段落里的纯文本，用于量宽度。"""
+    out = []
+    for element in (paragraph or {}).get("elements") or []:
+        text = element.get("text") if isinstance(element, dict) else None
+        if isinstance(text, dict):
+            content = (text.get("attributes") or {}).get("content")
+            if isinstance(content, str):
+                out.append(content)
     return "".join(out)
+
+
+def _cell_paragraphs(cell) -> list[str]:
+    """单元格里每一段的文本。
+
+    服务端按最长的一行给列宽（同一段里不会自动换行），所以必须逐段量，不能把一段
+    以上的内容拼成一整串再算。
+    """
+    lines = []
+    for child in (cell or {}).get("children") or []:
+        if isinstance(child, dict) and "paragraph" in child:
+            lines.append(_paragraph_text(child["paragraph"]))
+    return lines
 
 
 def _text_weight(text: str) -> float:
@@ -523,12 +529,25 @@ def _text_weight(text: str) -> float:
     return weight
 
 
-def _column_minima(table: dict, floor: int = TABLE_MIN_COL) -> list[int]:
-    """按单元格内容估算每列放得下的最小宽度，合并单元格按跨列均摊。
+def _line_width(weight: float, floor: int = TABLE_MIN_COL) -> int:
+    """行长对应的列宽：floor 以内按 floor，之后每字加 TABLE_COL_PER_CHAR。"""
+    return int(round(floor + TABLE_COL_PER_CHAR * max(0.0, weight - TABLE_COL_BASE_CHARS)))
 
-    服务端不认写入的 grid，会按内容兜底，所以要先估出下限，才能判断「压到版心」
-    是否可能。colspan 的内容由跨过的几列共同承载，按列数摊到每列；rowspan 只影响
-    占位，不影响宽度。
+
+def _chars_for_width(width: int, floor: int = TABLE_MIN_COL) -> int:
+    """宽度能放多少个字，与 _line_width 互为反函数。"""
+    chars = int((width - floor) // TABLE_COL_PER_CHAR) + TABLE_COL_BASE_CHARS
+    return max(chars, TABLE_COL_BASE_CHARS)
+
+
+def _column_metrics(table: dict, floor: int = TABLE_MIN_COL) -> tuple[list[int], list[int], list[float]]:
+    """返回（每列自然宽度, 每列不可再压的下限, 每列正文字数）。
+
+    - 自然宽度：该列所有段落里最长的一行；跨列单元格只记到它起始的那一列。实测
+      `colspan=2` 的表头写成 740 后回读是 [260, 164, ...]，合并内容只挤起始列。
+    - 不可再压的下限：普通过滤到 floor，跨列单元格另按自然宽度抬升——切行会改变
+      内容，合并单元格不做切行，所以它的宽度是硬约束。
+    - 正文字数：用来分配版心宽度，只看数据行不看表头；手动调列宽看的也是内容量。
     """
     rows = table.get("rows") or []
     grid = (table.get("attributes") or {}).get("grid") or []
@@ -537,10 +556,12 @@ def _column_minima(table: dict, floor: int = TABLE_MIN_COL) -> list[int]:
         columns = max((sum(max(int((cell.get("attributes") or {}).get("colspan") or 1), 1)
                            for cell in (row.get("cells") or [])) for row in rows), default=0)
     if columns <= 0:
-        return []
-    minima = [float(floor)] * columns
+        return [], [], []
+    natural = [float(floor)] * columns
+    baseline = [float(floor)] * columns
+    weights = [0.0] * columns
     pending = [0] * columns          # 被上方 rowspan 占住的列，>0 表示还占几行
-    for row in rows:
+    for row_index, row in enumerate(rows):
         column = 0
         for cell in row.get("cells") or []:
             while column < columns and pending[column] > 0:
@@ -550,16 +571,161 @@ def _column_minima(table: dict, floor: int = TABLE_MIN_COL) -> list[int]:
             attributes = cell.get("attributes") or {}
             colspan = max(int(attributes.get("colspan") or 1), 1)
             rowspan = max(int(attributes.get("rowspan") or 1), 1)
-            weight = _text_weight(_cell_text(cell))
-            need = floor + TABLE_COL_PER_CHAR * max(0.0, weight - TABLE_COL_BASE_CHARS)
-            share = need / colspan
-            for index in range(column, min(column + colspan, columns)):
-                minima[index] = max(minima[index], share)
+            lines = _cell_paragraphs(cell)
+            longest = max((_text_weight(line) for line in lines), default=0.0)
+            need = _line_width(longest, floor)
+            body = 0.0 if row_index == 0 else sum(_text_weight(line) for line in lines)
+            span = min(column + colspan, columns)
+            natural[column] = max(natural[column], need)
+            if colspan > 1:
+                baseline[column] = max(baseline[column], need)
+            for index in range(column, span):
+                weights[index] += body / colspan
                 if rowspan > 1:
                     pending[index] = rowspan
-            column += colspan
+            column = span
         pending = [max(value - 1, 0) for value in pending]
-    return [int(round(value)) for value in minima]
+    return ([int(round(value)) for value in natural],
+            [int(round(value)) for value in baseline], weights)
+
+
+def _plan_widths(weights: list[float], minima: list[int], total: int,
+                 floor: int = TABLE_MIN_COL) -> list[int] | None:
+    """按内容量把版心宽度分给各列：先满足内容下限，余量按字数开方分配。
+
+    开方是为了缓和差距：一列字数再多也只拿同量级列的两三倍，避免一列独大、其余
+    挤成竖排。
+    """
+    columns = len(weights)
+    if columns <= 0 or len(minima) != columns:
+        return None
+    base = [max(floor, low) for low in minima]
+    if sum(base) > total:
+        return None
+    extra = total - sum(base)
+    if extra <= 0 or not any(weights):
+        return base
+    roots = [math.sqrt(max(weight, 0.0)) for weight in weights]
+    root_sum = sum(roots) or columns
+    exact = [low + extra * root / root_sum for low, root in zip(base, roots)]
+    widths = [int(value) for value in exact]
+    gap = total - sum(widths)
+    order = sorted(range(columns), key=lambda i: exact[i] - widths[i], reverse=True)
+    for index in order[:max(gap, 0)]:
+        widths[index] += 1
+    return widths
+
+
+BREAK_CHARS = "，。；：、！？）”』】》,.;:!?)]}"
+
+
+def _split_text(text: str, limit: int) -> list[str]:
+    """把文字切成每行 limit 字，优先在标点或空白处断开。"""
+    if limit <= 0:
+        return [text]
+    pieces = []
+    rest = text
+    while len(rest) > limit:
+        window = rest[:limit]
+        cut = 0
+        for index in range(len(window) - 1, max(limit // 2, 1) - 1, -1):
+            if window[index] in BREAK_CHARS or window[index].isspace():
+                cut = index + 1
+                break
+        if not cut:
+            cut = limit
+        pieces.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    if rest:
+        pieces.append(rest)
+    return pieces
+
+
+def _reflow_cell(cell: dict, limit: int) -> bool:
+    """把单元格里超过 limit 字的段落拆成多段，相当于手动拖窄列后的换行。"""
+    changed = False
+    out = []
+    for child in cell.get("children") or []:
+        paragraph = child.get("paragraph") if isinstance(child, dict) else None
+        if not isinstance(paragraph, dict):
+            out.append(child)
+            continue
+        text = _paragraph_text(paragraph)
+        elements = paragraph.get("elements") or []
+        # 只处理纯文本段落：多元素的有行内样式，按字符重组会丢掉样式边界
+        if len(text) <= limit or len(elements) != 1:
+            out.append(child)
+            continue
+        for piece in _split_text(text, limit):
+            clone = json.loads(json.dumps(paragraph, ensure_ascii=False))
+            clone["elements"] = [{"text": {"attributes": {"content": piece}}}]
+            clone.pop("block_id", None)
+            clone.pop("range_marks", None)
+            out.append({"paragraph": clone})
+        changed = True
+    if changed:
+        cell["children"] = out
+    return changed
+
+
+def reflow_table(table: dict, total: int, floor: int = TABLE_MIN_COL,
+                 tolerance: float = TABLE_OVERFLOW_TOLERANCE) -> bool | None:
+    """按内容重排超宽表格：切行让列宽总和回到版心。
+
+    服务端只按单元格最长行给宽、不会自动换行，所以列宽写小也没用，整张表会被重算。
+    要真正压窄只能自己决定在哪里换行：先按正文字数把版心分给各列，再把每列里超过
+    该宽度的段落切成多段。返回 True 表示已重排，False 表示本来就不超宽，None 表示
+    列太多、每列连 floor 都分不到。
+    """
+    natural, baseline, weights = _column_metrics(table, floor)
+    if not natural:
+        return False
+    grid = (table.get("attributes") or {}).get("grid") or []
+    known = [value for value in grid if isinstance(value, (int, float))] if isinstance(grid, list) else []
+    # 以「自然宽度」和 WPS 自己给的 grid 中较大的为准，都超出版心才值得切行
+    current = max(sum(natural), int(sum(known)) if len(known) == len(natural) else 0)
+    if current <= total * (1 + tolerance):
+        return False
+    targets = _plan_widths(weights, baseline, total, floor)
+    if targets is None:
+        return None
+    rows = table.get("rows") or []
+    pending = [0] * len(targets)
+    for row in rows:
+        column = 0
+        for cell in row.get("cells") or []:
+            while column < len(targets) and pending[column] > 0:
+                column += 1
+            if column >= len(targets):
+                break
+            attributes = cell.get("attributes") or {}
+            colspan = max(int(attributes.get("colspan") or 1), 1)
+            rowspan = max(int(attributes.get("rowspan") or 1), 1)
+            span = min(column + colspan, len(targets))
+            # 跨列单元格的宽度只挤压起始列，下限已算在 targets[column] 里，不再切
+            if colspan == 1:
+                _reflow_cell(cell, _chars_for_width(targets[column], floor))
+            if rowspan > 1:
+                for index in range(column, span):
+                    pending[index] = rowspan
+            column = span
+        pending = [max(value - 1, 0) for value in pending]
+    attributes = table.setdefault("attributes", {})
+    attributes["grid"] = targets
+    attributes["width"] = total
+    return True
+
+
+def reflow_tables(blocks: list, total: int, tolerance: float = TABLE_OVERFLOW_TOLERANCE) -> int:
+    """给所有超宽表格切行，返回重排的张数。"""
+    if total <= 0:
+        return 0
+    reflowed = 0
+    for block in blocks:
+        table = block.get("table") if isinstance(block, dict) else None
+        if isinstance(table, dict) and reflow_table(table, total, tolerance=tolerance):
+            reflowed += 1
+    return reflowed
 
 
 def _shrink_grid(grid: list, total: int, minima: list[int] | int) -> list | None:
@@ -608,17 +774,18 @@ def fit_table_widths(blocks: list, total: int, min_col: int = TABLE_MIN_COL) -> 
         table = block.get("table") if isinstance(block, dict) else None
         if not isinstance(table, dict):
             continue
-        minima = _column_minima(table, min_col)
-        if not minima:
-            continue
         attributes = table.setdefault("attributes", {})
         grid = attributes.get("grid")
-        if not isinstance(grid, list) or len(grid) != len(minima):
-            grid = list(minima)                # 没有 grid 时先按内容下限铺开
-            attributes["grid"] = grid
-        known = [value for value in grid if isinstance(value, (int, float))]
-        if len(known) != len(minima):
+        known = [value for value in grid if isinstance(value, (int, float))] if isinstance(grid, list) else []
+        # 已经按切行排好的表不再二次压缩：合并单元格会让下限估算偏大
+        if known and attributes.get("width") == total and sum(known) == total:
             continue
+        minima = _column_metrics(table, min_col)[0]
+        if not minima:
+            continue
+        if len(known) != len(minima):
+            known = list(minima)               # 没有 grid 时先按内容下限铺开
+            attributes["grid"] = known
         if sum(minima) > total:
             crowded += 1
             continue
@@ -745,7 +912,7 @@ def prepare_markdown(file_id: str, md: str, *, base: str = ".",
                      timeout: int = 180, dry_run: bool = False,
                      images: str = "auto", img_pct: int = DEFAULT_IMG_PCT,
                      doc_width: int = DOC_WIDTH, table_width: int = DOC_WIDTH,
-                     progress=print) -> dict:
+                     reflow: bool = True, progress=print) -> dict:
     """Prepare all blocks before editing the document body."""
     check_html_tables(md)
     plan = image_plan(md, base) if images != "off" else []
@@ -805,17 +972,20 @@ def prepare_markdown(file_id: str, md: str, *, base: str = ".",
     if split:
         progress(f"超长表格：按 {MAX_TABLE_ROWS} 行上限拆出 {split} 张（重复表头）")
 
+    reflowed = reflow_tables(blocks, table_width) if reflow else 0
+    if reflowed:
+        progress(f"表格宽度：{reflowed} 张超宽表按内容切行，列宽之和回到 {table_width}px")
+
     fitted, crowded = fit_table_widths(blocks, table_width)
     if fitted:
         progress(f"表格宽度：{fitted} 张缩到 {table_width}px 以内（与正文同宽）")
     if crowded:
-        progress(f"表格宽度：{crowded} 张的单元格内容放不进 {table_width}px 版心"
-                 f"（单列下限约 {TABLE_MIN_COL}px，字越多越宽）；"
-                 "需要减少列、缩短单元格或拆表")
+        progress(f"表格宽度：{crowded} 张列数过多，{table_width}px 内每列不到 {TABLE_MIN_COL}px；"
+                 "需要拆表或减少列")
 
     return {"file_id": file_id, "children": blocks, "dry_run": dry_run,
             "blocks": len(blocks), "written": 0, "images": pictured,
-            "uploaded": uploaded, "split_tables": split,
+            "uploaded": uploaded, "split_tables": split, "table_reflowed": reflowed,
             "table_fitted": fitted, "table_crowded": crowded, "table_width": table_width}
 
 
@@ -950,13 +1120,14 @@ def report_table_widths(children: list, limit: int, progress=print) -> int:
     if limit <= 0:
         return 0
     over = []
+    threshold = limit * (1 + TABLE_OVERFLOW_TOLERANCE)
     for index, block in enumerate(children):
         table = block.get("table") if isinstance(block, dict) else None
         if not isinstance(table, dict):
             continue
         grid = (table.get("attributes") or {}).get("grid")
         if isinstance(grid, list) and grid and all(isinstance(v, (int, float)) for v in grid):
-            if sum(grid) > limit:
+            if sum(grid) > threshold:
                 over.append((index, len(grid), int(sum(grid))))
     if over:
         index, columns, width = max(over, key=lambda item: item[2])
@@ -1007,7 +1178,9 @@ def main() -> None:
     ap.add_argument("--doc-width", type=int, default=DOC_WIDTH,
                     help=f"正文宽度像素（默认 {DOC_WIDTH}）")
     ap.add_argument("--table-width", type=int, default=None,
-                    help="表格最大总宽像素，超宽按比例缩列宽（默认与 --doc-width 相同；0 不限制）")
+                    help="表格最大总宽像素（默认与 --doc-width 相同；0 不限制）")
+    ap.add_argument("--no-reflow", action="store_true",
+                    help="超宽表不切行，只按列宽压缩（切行会把长单元格拆成多段）")
     ap.add_argument("--chunk", type=int, default=200, help="每批写入的块数（默认 200）")
     ap.add_argument("--title", default="auto",
                     help="文档标题：auto 取自 front matter 的 title 或 md 文件名（默认）/ none 不写 / 其他值按原文写入")
@@ -1102,7 +1275,7 @@ def main() -> None:
     prepared = prepare_markdown(
         args.file_id, md, base=base, timeout=args.timeout,
         dry_run=args.dry_run, images="off" if args.update_block else args.images, img_pct=args.img_width,
-        doc_width=args.doc_width, table_width=table_width)
+        doc_width=args.doc_width, table_width=table_width, reflow=not args.no_reflow)
     if args.dry_run:
         print("dry-run：未修改正文或标题，未上传图片")
         return
@@ -1121,7 +1294,7 @@ def main() -> None:
     print(f"完成：{args.mode} {stats['written']} 个块到 {args.file_id}"
           f"（图片 {stats['images']} 张，拆表 {stats['split_tables']} 张）")
 
-    if stats.get("table_fitted") or stats.get("table_crowded"):
+    if stats.get("table_reflowed") or stats.get("table_fitted") or stats.get("table_crowded"):
         try:
             report_table_widths(doc_children(args.file_id, args.timeout), table_width)
         except _wps.WpsError as exc:
