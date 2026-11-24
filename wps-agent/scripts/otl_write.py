@@ -23,13 +23,18 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 import _wps
 
 _wps.use_utf8_stdio()
 MAX_BLOCKS_PER_CALL = 1000  # 服务端限制：doc_children.children 单次 ≤1000
 MAX_TABLE_ROWS = 100        # 服务端限制：table.rows maxItems=100，超了必须拆表
 DOC_WIDTH = 740             # 正文默认宽度（px），86% ≈ 636
-TABLE_MIN_COL = 132         # 表格单列最小宽度（px）：服务端按内容兜底约 6 个汉字宽
+#: 表格单列下限（px）：服务端按单元格内容兜底，1~5 个汉字也只到这么宽。
+TABLE_MIN_COL = 116
+#: 内容超过 BASE 个字后，每多一个字列宽下限增加约这么多（实测 9 字 180、13 字 244）。
+TABLE_COL_PER_CHAR = 16
+TABLE_COL_BASE_CHARS = 5
 DEFAULT_IMG_PCT = 86
 #: `<img src="...">` 与 `![alt](...)`，按出现顺序 —— 与 convert 出的 picture 块一一对应。
 IMAGE_RE = re.compile(r'<img[^>]*?\bsrc="([^"]+)"|!\[[^\]]*\]\(([^)\s]+)\)', re.IGNORECASE)
@@ -488,33 +493,113 @@ def fill_pictures(blocks: list, plan: list[dict], img_pct: int, doc_width: int,
 
 # ---------------------------------------------------------------- 超长表格
 
-def _shrink_grid(grid: list, total: int, min_col: int) -> list | None:
-    """把列宽压到 total，每列不低于 min_col；列太多压不下时返回 None。"""
+def _cell_text(cell) -> str:
+    """按顺序取出单元格里的所有文本，用于估算列宽下限。"""
+    out: list[str] = []
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            text = node.get("text")
+            if isinstance(text, dict):
+                content = (text.get("attributes") or {}).get("content")
+                if isinstance(content, str):
+                    out.append(content)
+            for key, value in node.items():
+                if key != "text" and isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk((cell or {}).get("children") or [])
+    return "".join(out)
+
+
+def _text_weight(text: str) -> float:
+    """按字宽折算：汉字与全角算 1，ASCII 约 0.55。"""
+    weight = 0.0
+    for char in text:
+        weight += 1.0 if unicodedata.east_asian_width(char) in {"W", "F"} else 0.55
+    return weight
+
+
+def _column_minima(table: dict, floor: int = TABLE_MIN_COL) -> list[int]:
+    """按单元格内容估算每列放得下的最小宽度，合并单元格按跨列均摊。
+
+    服务端不认写入的 grid，会按内容兜底，所以要先估出下限，才能判断「压到版心」
+    是否可能。colspan 的内容由跨过的几列共同承载，按列数摊到每列；rowspan 只影响
+    占位，不影响宽度。
+    """
+    rows = table.get("rows") or []
+    grid = (table.get("attributes") or {}).get("grid") or []
+    columns = len(grid)
+    if not columns:
+        columns = max((sum(max(int((cell.get("attributes") or {}).get("colspan") or 1), 1)
+                           for cell in (row.get("cells") or [])) for row in rows), default=0)
+    if columns <= 0:
+        return []
+    minima = [float(floor)] * columns
+    pending = [0] * columns          # 被上方 rowspan 占住的列，>0 表示还占几行
+    for row in rows:
+        column = 0
+        for cell in row.get("cells") or []:
+            while column < columns and pending[column] > 0:
+                column += 1
+            if column >= columns:
+                break
+            attributes = cell.get("attributes") or {}
+            colspan = max(int(attributes.get("colspan") or 1), 1)
+            rowspan = max(int(attributes.get("rowspan") or 1), 1)
+            weight = _text_weight(_cell_text(cell))
+            need = floor + TABLE_COL_PER_CHAR * max(0.0, weight - TABLE_COL_BASE_CHARS)
+            share = need / colspan
+            for index in range(column, min(column + colspan, columns)):
+                minima[index] = max(minima[index], share)
+                if rowspan > 1:
+                    pending[index] = rowspan
+            column += colspan
+        pending = [max(value - 1, 0) for value in pending]
+    return [int(round(value)) for value in minima]
+
+
+def _shrink_grid(grid: list, total: int, minima: list[int] | int) -> list | None:
+    """把列宽压到 total，每列不低于自己的内容下限；总下限超了就返回 None。"""
     widths = []
     for value in grid:
         try:
             widths.append(max(int(value), 1))
         except (TypeError, ValueError):
             return None
-    if not widths or len(widths) * min_col > total:
+    if isinstance(minima, int):
+        minima = [minima] * len(widths)
+    if not widths or len(minima) != len(widths) or sum(minima) > total:
         return None
-    # 先给每列保底 min_col，剩余宽度按原比例分配
-    extra = total - len(widths) * min_col
-    weight = sum(widths)
-    scaled = [min_col + int(round(extra * width / weight)) for width in widths]
+    extra = total - sum(minima)
+    caps = [max(width - low, 0) for width, low in zip(widths, minima)]
+    if sum(caps) >= extra:                     # 有余量的列按余量分，窄列不再被压
+        weight = sum(caps) or len(caps)
+        shares = [extra * cap / weight for cap in caps]
+    else:                                      # 全部压到下限还不够，按原宽比例再加
+        weight = sum(widths) or len(widths)
+        shares = [extra * width / weight for width in widths]
+    exact = [low + share for low, share in zip(minima, shares)]
+    scaled = [int(value) for value in exact]
     gap = total - sum(scaled)
-    if gap:
-        target = scaled.index(max(scaled))
-        scaled[target] += gap
-    return scaled if all(width >= min_col for width in scaled) else None
+    if gap > 0:                                # 取整丢的像素补给小数部分最大的列
+        order = sorted(range(len(exact)), key=lambda i: exact[i] - scaled[i], reverse=True)
+        for index in order[:gap]:
+            scaled[index] += 1
+    return scaled
 
 
 def fit_table_widths(blocks: list, total: int, min_col: int = TABLE_MIN_COL) -> tuple[int, int]:
-    """把超宽表格压到正文宽度，返回（压住的张数, 列太多压不下的张数）。
+    """把超宽表格压到正文宽度，返回（压住的张数, 内容放不下的张数）。
 
-    convert 按内容估算列宽，总宽不封顶；服务端对 table.attributes.width 做总宽约束，
-    每列另有内容下限（实测约 132px，即 6 个汉字）：列数 × 下限超过版心时，无论怎么写
-    都会溢出，只能改内容结构（少几列、缩短单元格，或拆成多张表）。
+    服务端只把写入的 grid 当期望值，最终按单元格内容兜底：单列下限 116px（1~5 个
+    汉字），之后每多一个字加 16px（9 字约 180px、13 字约 244px）。列数 × 内容下限
+    超过版心时，压也白压，只能改内容结构（减少列、缩短单元格或拆表）。HTML 表格与
+    Markdown 表格一样在这里处理：两者都经 convert 变成同一套 table 块，合并单元格
+    的内容按跨列均摊。
     """
     if total <= 0:
         return 0, 0
@@ -523,16 +608,25 @@ def fit_table_widths(blocks: list, total: int, min_col: int = TABLE_MIN_COL) -> 
         table = block.get("table") if isinstance(block, dict) else None
         if not isinstance(table, dict):
             continue
-        attributes = table.get("attributes")
-        if not isinstance(attributes, dict):
+        minima = _column_minima(table, min_col)
+        if not minima:
             continue
+        attributes = table.setdefault("attributes", {})
         grid = attributes.get("grid")
-        if not isinstance(grid, list) or not grid:
+        if not isinstance(grid, list) or len(grid) != len(minima):
+            grid = list(minima)                # 没有 grid 时先按内容下限铺开
+            attributes["grid"] = grid
+        known = [value for value in grid if isinstance(value, (int, float))]
+        if len(known) != len(minima):
             continue
-        known = [v for v in grid if isinstance(v, (int, float))]
-        if len(known) != len(grid) or sum(known) <= total:
+        if sum(minima) > total:
+            crowded += 1
             continue
-        scaled = _shrink_grid(grid, total, min_col)
+        # 服务端会把低于内容下限的列撑到下限，所以按「原宽与下限取大」判断是否需要压
+        desired = [max(int(value), low) for value, low in zip(known, minima)]
+        if sum(desired) <= total:
+            continue
+        scaled = _shrink_grid(desired, total, minima)
         if scaled is None:
             crowded += 1
             continue
@@ -626,12 +720,34 @@ def unmask_headings(blocks: list) -> int:
     return restored
 
 
+FENCE_RE = re.compile(r"^```[^\n]*\n.*?^```", re.MULTILINE | re.DOTALL)
+HTML_TABLE_RE = re.compile(r"<table\b[^>]*>(.*?)</table\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def check_html_tables(md: str) -> None:
+    """HTML 表格必须带 thead 或 tbody。
+
+    实测 `<table><tr><td>` 会被 convert 整段丢掉，只剩一个空的 column 块，正文里
+    的表格凭空消失且没有任何报错。围栏代码块里的示例跳过，不算正文表格。
+    """
+    text = FENCE_RE.sub("", md)
+    text = re.sub(r"`[^`\n]*`", "", text)          # 行内代码里的示例也不算正文表格
+    for match in HTML_TABLE_RE.finditer(text):
+        inner = match.group(1).lower()
+        if "<thead" in inner or "<tbody" in inner:
+            continue
+        snippet = re.sub(r"\s+", " ", match.group(0))[:60]
+        sys.exit(f"[otl_write] HTML 表格缺少 <thead>/<tbody>，转换会整段丢弃：{snippet}…；"
+                 "补上表头或表体标签再写入")
+
+
 def prepare_markdown(file_id: str, md: str, *, base: str = ".",
                      timeout: int = 180, dry_run: bool = False,
                      images: str = "auto", img_pct: int = DEFAULT_IMG_PCT,
                      doc_width: int = DOC_WIDTH, table_width: int = DOC_WIDTH,
                      progress=print) -> dict:
     """Prepare all blocks before editing the document body."""
+    check_html_tables(md)
     plan = image_plan(md, base) if images != "off" else []
     masked_md, masked = mask_heading_numbers(md)
     converted = api("post", f"/v7/airpage/v2/{_wps.segment(file_id)}/blocks/convert",
@@ -693,8 +809,9 @@ def prepare_markdown(file_id: str, md: str, *, base: str = ".",
     if fitted:
         progress(f"表格宽度：{fitted} 张缩到 {table_width}px 以内（与正文同宽）")
     if crowded:
-        progress(f"表格宽度：{crowded} 张列数过多，按每列 {TABLE_MIN_COL}px 下限放不进 "
-                 f"{table_width}px；需要减少列、缩短单元格或拆表")
+        progress(f"表格宽度：{crowded} 张的单元格内容放不进 {table_width}px 版心"
+                 f"（单列下限约 {TABLE_MIN_COL}px，字越多越宽）；"
+                 "需要减少列、缩短单元格或拆表")
 
     return {"file_id": file_id, "children": blocks, "dry_run": dry_run,
             "blocks": len(blocks), "written": 0, "images": pictured,
@@ -827,8 +944,8 @@ def commit_document(file_id: str, prepared: dict, *, mode: str,
 def report_table_widths(children: list, limit: int, progress=print) -> int:
     """统计仍超出正文宽度的表格并报告，返回张数。
 
-    列宽最终由服务端按单元格内容兜底（约 6 个汉字起），写入时的 grid 只是期望值，
-    文字多的表会被撑开，所以以回读结果为准。
+    列宽最终由服务端按单元格内容兜底（116px 起，字越多越宽），写入时的 grid 只是
+    期望值，文字多的表会被撑开，所以以回读结果为准。
     """
     if limit <= 0:
         return 0

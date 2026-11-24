@@ -278,12 +278,52 @@ class DocumentTests(unittest.TestCase):
         self.assertNotIn("width", narrow["table"]["attributes"])
 
     def test_airpage_reports_tables_too_crowded_to_shrink(self):
-        for columns in (6, 8, 20):
-            grid = [150] * columns
-            block = {"table": {"attributes": {"grid": list(grid)}, "rows": [{"cells": []}]}}
+        def table(columns, text):
+            cell = {"attributes": {"colspan": 1, "rowspan": 1},
+                    "children": [{"paragraph": {"elements": [
+                        {"text": {"attributes": {"content": text}}}]}}]}
+            return {"table": {"attributes": {"grid": [150] * columns},
+                              "rows": [{"cells": [cell for _ in range(columns)]}]}}
+
+        # 8 列短内容已是 8×116=928，20 列同理；6 列写 8 个汉字是 6×180=1080
+        for columns, text in ((8, "测"), (20, "测"), (6, "测站名称长度八个字")):
+            block = table(columns, text)
+            grid = list(block["table"]["attributes"]["grid"])
             self.assertEqual(otl_write.fit_table_widths([block], 740), (0, 1))
             self.assertEqual(block["table"]["attributes"]["grid"], grid)
             self.assertNotIn("width", block["table"]["attributes"])
+
+    def test_airpage_fits_six_narrow_columns_to_body_width(self):
+        cell = {"attributes": {"colspan": 1, "rowspan": 1},
+                "children": [{"paragraph": {"elements": [
+                    {"text": {"attributes": {"content": "0101"}}}]}}]}
+        block = {"table": {"attributes": {"grid": [150] * 6},
+                           "rows": [{"cells": [cell for _ in range(6)]}]}}
+        self.assertEqual(otl_write.fit_table_widths([block], 740), (1, 0))
+        attributes = block["table"]["attributes"]
+        self.assertEqual(sum(attributes["grid"]), 740)
+        self.assertGreaterEqual(min(attributes["grid"]), otl_write.TABLE_MIN_COL)
+
+    def test_airpage_fits_merged_cell_tables(self):
+        def cell(text, colspan=1, rowspan=1):
+            return {"attributes": {"colspan": colspan, "rowspan": rowspan},
+                    "children": [{"paragraph": {"elements": [
+                        {"text": {"attributes": {"content": text}}}]}}]}
+
+        block = {"table": {"attributes": {"grid": [237, 116, 237, 116, 116]},
+                           "rows": [{"cells": [cell("一级分类", 2), cell("二级分类", 2), cell("代码", 1, 2)]},
+                                    {"cells": [cell("代码"), cell("名称"), cell("代码"), cell("名称")]},
+                                    {"cells": [cell("01"), cell("水文"), cell("01"), cell("站网"), cell("0101")]}]}}
+        self.assertEqual(otl_write.fit_table_widths([block], 740), (1, 0))
+        attributes = block["table"]["attributes"]
+        self.assertEqual(sum(attributes["grid"]), 740)
+        self.assertGreaterEqual(min(attributes["grid"]), otl_write.TABLE_MIN_COL)
+
+    def test_airpage_rejects_html_table_without_thead_or_tbody(self):
+        with self.assertRaisesRegex(SystemExit, "thead"):
+            otl_write.check_html_tables("<table><tr><td>甲</td><td>乙</td></tr></table>\n")
+        otl_write.check_html_tables("<table><tbody><tr><td>甲</td></tr></tbody></table>\n")
+        otl_write.check_html_tables("```html\n<table><tr><td>示例</td></tr></table>\n```\n")
 
     def test_airpage_table_width_zero_keeps_grid(self):
         block = {"table": {"attributes": {"grid": [800, 800]}, "rows": [{"cells": []}]}}
