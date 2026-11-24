@@ -264,6 +264,45 @@ class DocumentTests(unittest.TestCase):
             otl_write.commit_document("f", prepared, mode="replace", baseline=[old],
                                       progress=lambda _: None)
 
+    def test_airpage_fits_wide_tables_to_body_width(self):
+        wide = {"table": {"attributes": {"grid": [260, 320, 280, 240]},
+                          "rows": [{"cells": []}]}}
+        narrow = {"table": {"attributes": {"grid": [370, 370]}, "rows": [{"cells": []}]}}
+        fitted, crowded = otl_write.fit_table_widths([wide, narrow], 740)
+        self.assertEqual((fitted, crowded), (1, 0))
+        attributes = wide["table"]["attributes"]
+        self.assertEqual(sum(attributes["grid"]), 740)
+        self.assertEqual(attributes["width"], 740)
+        self.assertGreaterEqual(min(attributes["grid"]), otl_write.TABLE_MIN_COL)
+        self.assertEqual(narrow["table"]["attributes"]["grid"], [370, 370])
+        self.assertNotIn("width", narrow["table"]["attributes"])
+
+    def test_airpage_reports_tables_too_crowded_to_shrink(self):
+        for columns in (6, 8, 20):
+            grid = [150] * columns
+            block = {"table": {"attributes": {"grid": list(grid)}, "rows": [{"cells": []}]}}
+            self.assertEqual(otl_write.fit_table_widths([block], 740), (0, 1))
+            self.assertEqual(block["table"]["attributes"]["grid"], grid)
+            self.assertNotIn("width", block["table"]["attributes"])
+
+    def test_airpage_table_width_zero_keeps_grid(self):
+        block = {"table": {"attributes": {"grid": [800, 800]}, "rows": [{"cells": []}]}}
+        self.assertEqual(otl_write.fit_table_widths([block], 0), (0, 0))
+        self.assertEqual(block["table"]["attributes"]["grid"], [800, 800])
+
+    def test_airpage_reports_tables_over_body_width(self):
+        blocks = [
+            {"paragraph": {"elements": [{"text": {"attributes": {"content": "说明"}}}]}},
+            {"table": {"attributes": {"grid": [116, 116, 141, 173, 157, 125, 125, 125]}, "rows": []}},
+            {"table": {"attributes": {"grid": [370, 370]}, "rows": []}},
+        ]
+        messages = []
+        self.assertEqual(otl_write.report_table_widths(blocks, 740, progress=messages.append), 1)
+        self.assertIn("1078px", messages[0])
+        self.assertIn("8 列", messages[0])
+        self.assertIn("第 1 块", messages[0])
+        self.assertEqual(otl_write.report_table_widths(blocks, 0, progress=messages.append), 0)
+
     def test_airpage_keeps_original_heading_numbers(self):
         md = "## 4.1 概述\n\n正文里的 4.1 不动\n\n### 4.1.1 细节\n\n## 前言"
         masked, count = otl_write.mask_heading_numbers(md)

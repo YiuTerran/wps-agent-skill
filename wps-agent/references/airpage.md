@@ -47,4 +47,17 @@ python3 scripts/otl_write.py --file-id FILE_ID --delete-range 1710:3417
 
 `--count-blocks` 打印一级块总数、类型分布和首末块，用于判断是否还有重复副本；`--delete-range START:END` 按一级块索引区间删除，索引从 0 开始。确认残留区间时按块内容对齐——新副本以文首标记块（如来源说明）开始，原副本紧随其后，区间终点为插入块数加原块数。
 
+## 表格宽度
+
+正文版心 740px，服务端给两列表的默认总宽也是 740，超过这个宽度表格会顶到页边。列宽最终由服务端按单元格内容兜底：每列下限约 132px（6 个汉字），文字越长列越宽，写入时给的 `grid` 只是期望值。实测 5 列以内能保持与正文同宽，6 列看文字长度，8 列总宽 1000px 以上，压不回版心。
+
+`--table-width` 指定期望总宽（默认 740，0 不处理）。超宽表按比例重排列宽并写入 `table.attributes.width`；写完回读核对，压不下来的报出块索引、列数和实际宽度。
+
+```sh
+python3 scripts/otl_write.py --file-id FILE_ID --md content.md --mode replace \
+  --expect-snapshot /tmp/blocks.json --table-width 740
+```
+
+生成 Markdown 时按 5 列设计：字段清单用「字段标识符｜类型｜说明」三列，长说明拆成短句放最后一列；列更多的表拆成两张并重复主键列，比压列宽可靠。
+
 上传本地图片需要带 Pillow 的 Python 解释器。把图片放在 Markdown 文件所在目录或 `--img-base` 指定的目录内。脚本将返回的附件 ID 填入图片块。超长表按服务端 100 行限制拆表。后续读取时从块树校验顺序和正文，转码后的图片外观需单独检查。

@@ -29,6 +29,7 @@ _wps.use_utf8_stdio()
 MAX_BLOCKS_PER_CALL = 1000  # 服务端限制：doc_children.children 单次 ≤1000
 MAX_TABLE_ROWS = 100        # 服务端限制：table.rows maxItems=100，超了必须拆表
 DOC_WIDTH = 740             # 正文默认宽度（px），86% ≈ 636
+TABLE_MIN_COL = 132         # 表格单列最小宽度（px）：服务端按内容兜底约 6 个汉字宽
 DEFAULT_IMG_PCT = 86
 #: `<img src="...">` 与 `![alt](...)`，按出现顺序 —— 与 convert 出的 picture 块一一对应。
 IMAGE_RE = re.compile(r'<img[^>]*?\bsrc="([^"]+)"|!\[[^\]]*\]\(([^)\s]+)\)', re.IGNORECASE)
@@ -487,6 +488,60 @@ def fill_pictures(blocks: list, plan: list[dict], img_pct: int, doc_width: int,
 
 # ---------------------------------------------------------------- 超长表格
 
+def _shrink_grid(grid: list, total: int, min_col: int) -> list | None:
+    """把列宽压到 total，每列不低于 min_col；列太多压不下时返回 None。"""
+    widths = []
+    for value in grid:
+        try:
+            widths.append(max(int(value), 1))
+        except (TypeError, ValueError):
+            return None
+    if not widths or len(widths) * min_col > total:
+        return None
+    # 先给每列保底 min_col，剩余宽度按原比例分配
+    extra = total - len(widths) * min_col
+    weight = sum(widths)
+    scaled = [min_col + int(round(extra * width / weight)) for width in widths]
+    gap = total - sum(scaled)
+    if gap:
+        target = scaled.index(max(scaled))
+        scaled[target] += gap
+    return scaled if all(width >= min_col for width in scaled) else None
+
+
+def fit_table_widths(blocks: list, total: int, min_col: int = TABLE_MIN_COL) -> tuple[int, int]:
+    """把超宽表格压到正文宽度，返回（压住的张数, 列太多压不下的张数）。
+
+    convert 按内容估算列宽，总宽不封顶；服务端对 table.attributes.width 做总宽约束，
+    每列另有内容下限（实测约 132px，即 6 个汉字）：列数 × 下限超过版心时，无论怎么写
+    都会溢出，只能改内容结构（少几列、缩短单元格，或拆成多张表）。
+    """
+    if total <= 0:
+        return 0, 0
+    fitted = crowded = 0
+    for block in blocks:
+        table = block.get("table") if isinstance(block, dict) else None
+        if not isinstance(table, dict):
+            continue
+        attributes = table.get("attributes")
+        if not isinstance(attributes, dict):
+            continue
+        grid = attributes.get("grid")
+        if not isinstance(grid, list) or not grid:
+            continue
+        known = [v for v in grid if isinstance(v, (int, float))]
+        if len(known) != len(grid) or sum(known) <= total:
+            continue
+        scaled = _shrink_grid(grid, total, min_col)
+        if scaled is None:
+            crowded += 1
+            continue
+        attributes["grid"] = scaled
+        attributes["width"] = total
+        fitted += 1
+    return fitted, crowded
+
+
 def split_wide_tables(blocks: list, max_rows: int = MAX_TABLE_ROWS) -> tuple[list, int]:
     """把超过 max_rows 行的表格拆成多张（重复表头）。
 
@@ -574,7 +629,8 @@ def unmask_headings(blocks: list) -> int:
 def prepare_markdown(file_id: str, md: str, *, base: str = ".",
                      timeout: int = 180, dry_run: bool = False,
                      images: str = "auto", img_pct: int = DEFAULT_IMG_PCT,
-                     doc_width: int = DOC_WIDTH, progress=print) -> dict:
+                     doc_width: int = DOC_WIDTH, table_width: int = DOC_WIDTH,
+                     progress=print) -> dict:
     """Prepare all blocks before editing the document body."""
     plan = image_plan(md, base) if images != "off" else []
     masked_md, masked = mask_heading_numbers(md)
@@ -633,9 +689,17 @@ def prepare_markdown(file_id: str, md: str, *, base: str = ".",
     if split:
         progress(f"超长表格：按 {MAX_TABLE_ROWS} 行上限拆出 {split} 张（重复表头）")
 
+    fitted, crowded = fit_table_widths(blocks, table_width)
+    if fitted:
+        progress(f"表格宽度：{fitted} 张缩到 {table_width}px 以内（与正文同宽）")
+    if crowded:
+        progress(f"表格宽度：{crowded} 张列数过多，按每列 {TABLE_MIN_COL}px 下限放不进 "
+                 f"{table_width}px；需要减少列、缩短单元格或拆表")
+
     return {"file_id": file_id, "children": blocks, "dry_run": dry_run,
             "blocks": len(blocks), "written": 0, "images": pictured,
-            "uploaded": uploaded, "split_tables": split}
+            "uploaded": uploaded, "split_tables": split,
+            "table_fitted": fitted, "table_crowded": crowded, "table_width": table_width}
 
 
 def body_fingerprint(children: list) -> str:
@@ -760,6 +824,30 @@ def commit_document(file_id: str, prepared: dict, *, mode: str,
     return {**stats, "final_blocks": len(saved)}
 
 
+def report_table_widths(children: list, limit: int, progress=print) -> int:
+    """统计仍超出正文宽度的表格并报告，返回张数。
+
+    列宽最终由服务端按单元格内容兜底（约 6 个汉字起），写入时的 grid 只是期望值，
+    文字多的表会被撑开，所以以回读结果为准。
+    """
+    if limit <= 0:
+        return 0
+    over = []
+    for index, block in enumerate(children):
+        table = block.get("table") if isinstance(block, dict) else None
+        if not isinstance(table, dict):
+            continue
+        grid = (table.get("attributes") or {}).get("grid")
+        if isinstance(grid, list) and grid and all(isinstance(v, (int, float)) for v in grid):
+            if sum(grid) > limit:
+                over.append((index, len(grid), int(sum(grid))))
+    if over:
+        index, columns, width = max(over, key=lambda item: item[2])
+        progress(f"表格宽度：{len(over)} 张超过 {limit}px，最宽 {width}px"
+                 f"（第 {index} 块，{columns} 列）；单元格文字多时服务端按内容保底，压不下去")
+    return len(over)
+
+
 def update_block(file_id, block_id, prepared, snap_path, timeout, force):
     children = doc_children(file_id, timeout)
     current = next((block for block in children if _block_id(block) == block_id), None)
@@ -801,6 +889,8 @@ def main() -> None:
                     help=f"图片渲染宽度占正文宽度的百分比（默认 {DEFAULT_IMG_PCT}；0 表示用原始宽度）")
     ap.add_argument("--doc-width", type=int, default=DOC_WIDTH,
                     help=f"正文宽度像素（默认 {DOC_WIDTH}）")
+    ap.add_argument("--table-width", type=int, default=None,
+                    help="表格最大总宽像素，超宽按比例缩列宽（默认与 --doc-width 相同；0 不限制）")
     ap.add_argument("--chunk", type=int, default=200, help="每批写入的块数（默认 200）")
     ap.add_argument("--title", default="auto",
                     help="文档标题：auto 取自 front matter 的 title 或 md 文件名（默认）/ none 不写 / 其他值按原文写入")
@@ -891,10 +981,11 @@ def main() -> None:
             raise ValueError("标题快照已失效，请重新读取后再改标题")
 
     baseline = doc_children(args.file_id, args.timeout)
+    table_width = args.doc_width if args.table_width is None else args.table_width
     prepared = prepare_markdown(
         args.file_id, md, base=base, timeout=args.timeout,
         dry_run=args.dry_run, images="off" if args.update_block else args.images, img_pct=args.img_width,
-        doc_width=args.doc_width)
+        doc_width=args.doc_width, table_width=table_width)
     if args.dry_run:
         print("dry-run：未修改正文或标题，未上传图片")
         return
@@ -912,6 +1003,12 @@ def main() -> None:
                             baseline=baseline, timeout=args.timeout, chunk=args.chunk)
     print(f"完成：{args.mode} {stats['written']} 个块到 {args.file_id}"
           f"（图片 {stats['images']} 张，拆表 {stats['split_tables']} 张）")
+
+    if stats.get("table_fitted") or stats.get("table_crowded"):
+        try:
+            report_table_widths(doc_children(args.file_id, args.timeout), table_width)
+        except _wps.WpsError as exc:
+            print(f"表格宽度：回读失败，未能核对实际宽度（{exc}）")
 
     action = ensure_title(args.file_id, title, args.timeout, overwrite=args.retitle, expected=expected_title)
     if action == "set":
