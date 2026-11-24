@@ -254,13 +254,13 @@ class DocumentTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "超出"):
                 otl_write.image_plan("![外部文件](../secret.png)", directory)
 
-    def test_airpage_replace_reports_leftover_range_when_readback_fails(self):
+    def test_airpage_replace_reports_when_readback_fails(self):
         old = {"paragraph": {"block_id": "old", "elements": [{"text": {"attributes": {"content": "旧"}}}]}}
         prepared = {"file_id": "f", "children": [], "dry_run": False, "written": 0}
         with (patch.object(otl_write, "doc_children",
-                           side_effect=[[old], [old], _wps.WpsError("读取", "响应无法解析")]),
+                           side_effect=[[old], _wps.WpsError("读取", "响应无法解析")]),
               patch.object(otl_write, "api", return_value={}),
-              self.assertRaisesRegex(SystemExit, "--delete-range 0:1")):
+              self.assertRaisesRegex(SystemExit, "回读失败")):
             otl_write.commit_document("f", prepared, mode="replace", baseline=[old],
                                       progress=lambda _: None)
 
@@ -356,6 +356,74 @@ class DocumentTests(unittest.TestCase):
         pieces = otl_write._split_text("一二三四五，六七三四五八九十", 6)
         self.assertEqual(pieces[0], "一二三四五，")
         self.assertTrue(all(len(piece) <= 6 for piece in pieces))
+
+    def test_airpage_split_text_keeps_identifiers_whole(self):
+        # 标识符不能从中间断开，宁可整词超宽独占一行
+        self.assertEqual(otl_write._split_text("表标识 ST_RSVRSTRL_B 见附录", 6),
+                         ["表标识", "ST_RSVRSTRL_B", "见附录"])
+        self.assertEqual(otl_write._token_weight("测站名称"), 1.0)
+        self.assertGreater(otl_write._token_weight("类型 VARCHAR2(20)"), 5.0)
+
+    def test_airpage_leaves_crowded_tables_for_manual_adjustment(self):
+        # 10 列字段表：10×116=1160 已超版心，切行也进不去，保持原样交给人工拖
+        header = [self._aria_cell(name) for name in
+                  ("序号", "属性类别", "字段名称", "字段标识", "类型及长度",
+                   "有无空值", "计量单位", "主键", "外键", "索引序号")]
+        row = [self._aria_cell(text) for text in
+               ("1", "基本", "测站编码", "STCD", "VARCHAR2(20)", "N", "", "1", "", "")]
+        table = {"table": {"attributes": {"grid": [1340] + [0] * 9},
+                           "rows": [{"cells": header}, {"cells": row}]}}
+        before = list(table["table"]["attributes"]["grid"])
+        self.assertEqual(otl_write.reflow_tables([table], 740), 0)
+        self.assertEqual(table["table"]["attributes"]["grid"], before)
+        self.assertEqual(len(otl_write.overflowing_tables([table], 740)), 1)
+
+    def test_airpage_replace_skips_unchanged_blocks(self):
+        # 内容一致的表格不能重写：用户手动拖过的列宽要留在云端
+        def para(text, bid):
+            return {"paragraph": {"block_id": bid, "elements": [
+                {"text": {"attributes": {"content": text}}}]}}
+
+        def table(bid, grid):
+            cells = [{"children": [para("序号", "p1")]}]
+            return {"table": {"block_id": bid, "attributes": {"grid": grid},
+                              "rows": [{"cells": cells}]}}
+
+        old = [para("甲", "a"), table("t1", [76, 84]), para("乙", "b")]
+        new = [para("甲", "a2"), table("t2", [116, 116]), para("乙", "b2")]
+        prepared = {"file_id": "f", "children": new, "dry_run": False,
+                    "images": 0, "split_tables": 0, "table_reflowed": 0,
+                    "table_fitted": 0, "table_crowded": 0, "table_manual": 0}
+        messages = []
+        with (patch.object(otl_write, "doc_children", return_value=old),
+              patch.object(otl_write, "api") as write):
+            stats = otl_write.commit_document("f", prepared, mode="replace", baseline=old,
+                                              progress=messages.append)
+        self.assertEqual(stats["written"], 0)
+        write.assert_not_called()
+        self.assertIn("未写入任何块", messages[0])
+
+    def test_airpage_replace_only_rewrites_changed_span(self):
+        def para(text, bid):
+            return {"paragraph": {"block_id": bid, "elements": [
+                {"text": {"attributes": {"content": text}}}]}}
+
+        old = [para("甲", "a"), para("乙", "b"), para("丙", "c")]
+        new = [para("甲", "a2"), para("乙改", "b2"), para("丙", "c2")]
+        saved = [para("甲", "x1"), para("乙改", "x2"), para("丙", "x3")]
+        prepared = {"file_id": "f", "children": new, "dry_run": False,
+                    "images": 0, "split_tables": 0, "table_reflowed": 0,
+                    "table_fitted": 0, "table_crowded": 0, "table_manual": 0}
+        reads = [old, [para("甲", "a"), para("乙改", "x2"), para("丙", "c")], saved]
+        with (patch.object(otl_write, "doc_children", side_effect=reads),
+              patch.object(otl_write, "api") as write):
+            stats = otl_write.commit_document("f", prepared, mode="replace", baseline=old,
+                                              progress=lambda _: None)
+        self.assertEqual(stats["written"], 1)
+        self.assertEqual(stats["deleted"], 1)
+        paths = [call.args[1] for call in write.call_args_list]
+        self.assertEqual(paths, ["/v7/airpage/v2/f/blocks/create",
+                                 "/v7/airpage/v2/f/blocks/delete"])
 
     def test_airpage_reflows_wide_tables_to_body_width(self):
         long = "用于存储测站的基本属性信息其中包括测站编码测站名称河流名称"

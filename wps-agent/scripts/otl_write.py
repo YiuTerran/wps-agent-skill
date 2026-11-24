@@ -17,6 +17,7 @@ picture 块 `id` 是空串、尺寸是 300x300 占位；直接把空 id 写进�
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import math
@@ -534,6 +535,16 @@ def _line_width(weight: float, floor: int = TABLE_MIN_COL) -> int:
     return int(round(floor + TABLE_COL_PER_CHAR * max(0.0, weight - TABLE_COL_BASE_CHARS)))
 
 
+#: 不能从中间断开的词：标识符、类型、代码。汉字可逐字断行，这些断了就读不懂。
+TOKEN_RE = re.compile(r"[0-9A-Za-z_][0-9A-Za-z_.\-/%()]*")
+
+
+def _token_weight(text: str) -> float:
+    """最长不可断词的宽度。汉字算 1（可逐字断开），ASCII 词整体算。"""
+    return max((_text_weight(match.group(0)) for match in TOKEN_RE.finditer(text or "")),
+               default=1.0)
+
+
 def _chars_for_width(width: int, floor: int = TABLE_MIN_COL) -> int:
     """宽度能放多少个字，与 _line_width 互为反函数。"""
     chars = int((width - floor) // TABLE_COL_PER_CHAR) + TABLE_COL_BASE_CHARS
@@ -545,8 +556,9 @@ def _column_metrics(table: dict, floor: int = TABLE_MIN_COL) -> tuple[list[int],
 
     - 自然宽度：该列所有段落里最长的一行；跨列单元格只记到它起始的那一列。实测
       `colspan=2` 的表头写成 740 后回读是 [260, 164, ...]，合并内容只挤起始列。
-    - 不可再压的下限：普通过滤到 floor，跨列单元格另按自然宽度抬升——切行会改变
-      内容，合并单元格不做切行，所以它的宽度是硬约束。
+    - 不可再压的下限：普通列取 floor 与「最长不可断词」的较大者——汉字能逐字断行，
+      但 `ST_RSVRSTRL_B` 这类标识符断开就成了两行乱码；跨列单元格另按自然宽度抬升，
+      切行会改变内容，合并单元格不做切行，所以它的宽度是硬约束。
     - 正文字数：用来分配版心宽度，只看数据行不看表头；手动调列宽看的也是内容量。
     """
     rows = table.get("rows") or []
@@ -579,6 +591,10 @@ def _column_metrics(table: dict, floor: int = TABLE_MIN_COL) -> tuple[list[int],
             natural[column] = max(natural[column], need)
             if colspan > 1:
                 baseline[column] = max(baseline[column], need)
+            else:
+                token_need = max((_line_width(_token_weight(line), floor) for line in lines),
+                                 default=floor)
+                baseline[column] = max(baseline[column], token_need)
             for index in range(column, span):
                 weights[index] += body / colspan
                 if rowspan > 1:
@@ -619,25 +635,53 @@ def _plan_widths(weights: list[float], minima: list[int], total: int,
 BREAK_CHARS = "，。；：、！？）”』】》,.;:!?)]}"
 
 
+def _atoms(text: str) -> list[str]:
+    """切成不可再分的单元：汉字单字，ASCII 词整体。"""
+    atoms = []
+    index = 0
+    while index < len(text):
+        match = TOKEN_RE.match(text, index)
+        if match and match.end() > index:
+            atoms.append(match.group(0))
+            index = match.end()
+        else:
+            atoms.append(text[index])
+            index += 1
+    return atoms
+
+
+def _break_point(line: str, limit: int) -> int:
+    """行内最后一个适合断行的位置（标点或空白之后），太靠前就不切。"""
+    for index in range(min(len(line), limit) - 1, max(limit // 2, 1) - 1, -1):
+        if line[index] in BREAK_CHARS or line[index].isspace():
+            return index + 1
+    return 0
+
+
 def _split_text(text: str, limit: int) -> list[str]:
-    """把文字切成每行 limit 字，优先在标点或空白处断开。"""
+    """把文字切成每行 limit 字，优先在标点或空白处断开，标识符不拆开。"""
     if limit <= 0:
         return [text]
     pieces = []
-    rest = text
-    while len(rest) > limit:
-        window = rest[:limit]
-        cut = 0
-        for index in range(len(window) - 1, max(limit // 2, 1) - 1, -1):
-            if window[index] in BREAK_CHARS or window[index].isspace():
-                cut = index + 1
-                break
-        if not cut:
-            cut = limit
-        pieces.append(rest[:cut].rstrip())
-        rest = rest[cut:].lstrip()
-    if rest:
-        pieces.append(rest)
+    line = ""
+    for atom in _atoms(text):
+        if not line and atom.isspace():
+            continue                            # 行首不留空白
+        if len(line) + len(atom) <= limit:
+            line += atom
+            continue
+        if not line:
+            line = atom                        # 单个词就超宽，独占一行
+            continue
+        cut = _break_point(line, limit)
+        if cut:
+            pieces.append(line[:cut].rstrip())
+            line = line[cut:].lstrip() + atom
+        else:
+            pieces.append(line.rstrip())
+            line = atom.lstrip()
+    if line.strip():
+        pieces.append(line)
     return pieces
 
 
@@ -674,8 +718,8 @@ def reflow_table(table: dict, total: int, floor: int = TABLE_MIN_COL,
 
     服务端只按单元格最长行给宽、不会自动换行，所以列宽写小也没用，整张表会被重算。
     要真正压窄只能自己决定在哪里换行：先按正文字数把版心分给各列，再把每列里超过
-    该宽度的段落切成多段。返回 True 表示已重排，False 表示本来就不超宽，None 表示
-    列太多、每列连 floor 都分不到。
+    该宽度的段落切成多段。列数太多、每列连下限都分不到时不切行——切了也进不了版心，
+    只会把手动调整时要删的空行留下。返回 True 表示已重排，False 表示不动。
     """
     natural, baseline, weights = _column_metrics(table, floor)
     if not natural:
@@ -688,7 +732,7 @@ def reflow_table(table: dict, total: int, floor: int = TABLE_MIN_COL,
         return False
     targets = _plan_widths(weights, baseline, total, floor)
     if targets is None:
-        return None
+        return False
     rows = table.get("rows") or []
     pending = [0] * len(targets)
     for row in rows:
@@ -801,6 +845,24 @@ def fit_table_widths(blocks: list, total: int, min_col: int = TABLE_MIN_COL) -> 
         attributes["width"] = total
         fitted += 1
     return fitted, crowded
+
+
+def overflowing_tables(blocks: list, total: int,
+                       tolerance: float = TABLE_OVERFLOW_TOLERANCE) -> list[tuple[int, int, int]]:
+    """列出仍宽于版心的表：返回 [(块序号, 列数, 总宽)]。"""
+    if total <= 0:
+        return []
+    limit = total * (1 + tolerance)
+    found = []
+    for index, block in enumerate(blocks):
+        table = block.get("table") if isinstance(block, dict) else None
+        if not isinstance(table, dict):
+            continue
+        grid = (table.get("attributes") or {}).get("grid")
+        if isinstance(grid, list) and grid and all(isinstance(v, (int, float)) for v in grid):
+            if sum(grid) > limit:
+                found.append((index, len(grid), int(sum(grid))))
+    return found
 
 
 def split_wide_tables(blocks: list, max_rows: int = MAX_TABLE_ROWS) -> tuple[list, int]:
@@ -979,14 +1041,17 @@ def prepare_markdown(file_id: str, md: str, *, base: str = ".",
     fitted, crowded = fit_table_widths(blocks, table_width)
     if fitted:
         progress(f"表格宽度：{fitted} 张缩到 {table_width}px 以内（与正文同宽）")
-    if crowded:
-        progress(f"表格宽度：{crowded} 张列数过多，{table_width}px 内每列不到 {TABLE_MIN_COL}px；"
-                 "需要拆表或减少列")
+    wide = overflowing_tables(blocks, table_width)
+    if wide:
+        widest = max(wide, key=lambda item: item[2])
+        progress(f"表格宽度：{len(wide)} 张超过 {table_width}px（每列 {TABLE_MIN_COL}px 是服务端写入下限，"
+                 f"最宽 {widest[2]}px / {widest[1]} 列）；已保持原样，需在 WPS 里手动拖窄")
 
     return {"file_id": file_id, "children": blocks, "dry_run": dry_run,
             "blocks": len(blocks), "written": 0, "images": pictured,
             "uploaded": uploaded, "split_tables": split, "table_reflowed": reflowed,
-            "table_fitted": fitted, "table_crowded": crowded, "table_width": table_width}
+            "table_fitted": fitted, "table_crowded": crowded, "table_manual": len(wide),
+            "table_width": table_width}
 
 
 def body_fingerprint(children: list) -> str:
@@ -1063,6 +1128,78 @@ def write_prepared(file_id: str, prepared: dict, *, index: int = 0,
         "written": written, "final_blocks": len(current)}
 
 
+def _insert_blocks(file_id: str, index: int, blocks: list, timeout: int, chunk: int,
+                   progress=print, verify: bool = True) -> int:
+    """在 index 处插入若干块，默认逐批读回校验，返回插入个数。"""
+    step = max(1, min(chunk, MAX_BLOCKS_PER_CALL))
+    written = 0
+    for start in range(0, len(blocks), step):
+        piece = blocks[start:start + step]
+        offset = index + written
+        try:
+            api("post", f"/v7/airpage/v2/{_wps.segment(file_id)}/blocks/create",
+                {"block_id": "doc", "index": offset, "doc_children": {"children": piece}}, timeout)
+        except _wps.WpsError as exc:
+            if not exc.uncertain:
+                raise
+            progress("写入响应异常，正在读取云端块确认结果")
+        written += len(piece)
+        if not verify:
+            continue
+        saved = doc_children(file_id, timeout)[offset:offset + len(piece)]
+        if [content_signature(block) for block in saved] != [content_signature(block) for block in piece]:
+            sys.exit("[otl_write] 新增块的内容或位置与预期不一致，请回查云端内容后再操作")
+        progress(f"已写入并读回 {written}/{len(blocks)} 个块")
+    if not verify and len(blocks) > step:
+        progress(f"已写入 {written} 个块")
+    return written
+
+
+def replace_blocks_diff(file_id: str, current: list, prepared: dict, *,
+                        timeout: int = 180, chunk: int = 200, progress=print) -> dict:
+    """按块差异替换正文，内容没变的块原地保留。
+
+    整篇重写会把每张表重新创建一次，服务端按 116px/列 重算列宽，用户手动拖窄的列宽
+    就白调了。这里用块内容签名做 diff，只删除、插入真正变化的区间；未变的表格（含手动
+    列宽）原样留在云端。
+    """
+    new = prepared["children"]
+    old_keys = [content_signature(block) for block in current]
+    new_keys = [content_signature(block) for block in new]
+    ops = [op for op in difflib.SequenceMatcher(None, old_keys, new_keys,
+                                                autojunk=False).get_opcodes()
+           if op[0] != "equal"]
+    stats = {key: value for key, value in prepared.items() if key not in ("children", "dry_run")}
+    if not ops:
+        progress("正文与云端一致，未写入任何块（表格列宽保持不变）")
+        return {**stats, "written": 0, "deleted": 0, "final_blocks": len(current)}
+
+    inserted = deleted = 0
+    # 大文档逐段回读太慢，只在结尾整篇核对；小文档边写边读
+    verify_each = len(current) <= 1500
+    # 从后往前处理：后面的插入/删除不会挪动前面待处理区间的索引
+    for tag, i1, i2, j1, j2 in reversed(ops):
+        piece = new[j1:j2]
+        if piece:
+            inserted += _insert_blocks(file_id, i1, piece, timeout, chunk, progress,
+                                       verify=verify_each)
+        if i2 > i1:
+            start = i1 + len(piece)
+            api("post", f"/v7/airpage/v2/{_wps.segment(file_id)}/blocks/delete",
+                {"block_id": "doc", "start_index": start, "end_index": start + (i2 - i1)}, timeout)
+            deleted += i2 - i1
+            progress(f"已删除旧块 {deleted} 个（区间 [{start}, {start + (i2 - i1)})）")
+
+    try:
+        saved = doc_children(file_id, timeout)
+    except _wps.WpsError as exc:
+        sys.exit(f"[otl_write] 已写入 {inserted} 个块，但回读失败：{exc}\n"
+                 "请用 --count-blocks 确认云端块数后再决定是否重跑")
+    if [content_signature(block) for block in saved] != new_keys:
+        sys.exit("[otl_write] 增量替换后回读与预期不一致，请检查云端正文与备份")
+    return {**stats, "written": inserted, "deleted": deleted, "final_blocks": len(saved)}
+
+
 def commit_document(file_id: str, prepared: dict, *, mode: str,
                     baseline: list, timeout: int = 180, chunk: int = 200,
                     progress=print) -> dict:
@@ -1072,43 +1209,14 @@ def commit_document(file_id: str, prepared: dict, *, mode: str,
     if body_fingerprint(current) != body_fingerprint(baseline):
         sys.exit("[otl_write] 准备期间正文发生变化，已放弃写入；请重新读取并合并改动")
     backup_blocks(file_id, current)
-    index = 0 if mode in ("replace", "prepend") else len(current)
+    if mode == "replace":
+        return replace_blocks_diff(file_id, current, prepared, timeout=timeout,
+                                   chunk=chunk, progress=progress)
+    index = 0 if mode == "prepend" else len(current)
     if mode == "append" and current and is_blank_paragraph(current[-1]):
         index -= 1
-    stats = write_prepared(file_id, prepared, index=index, timeout=timeout,
-                           chunk=chunk, progress=progress)
-    if mode != "replace" or not any(not is_blank_paragraph(block) for block in current):
-        return stats
-
-    # Verify the replacement first. Remove only the original contiguous block range.
-    start = stats["written"]
-    end = start + len(current)
-    try:
-        latest = doc_children(file_id, timeout)
-    except _wps.WpsError as exc:
-        sys.exit(f"[otl_write] 新正文已写入 {start} 个块，但回读失败，旧正文尚未清理：{exc}\n"
-                 f"请稍后用 --count-blocks 确认块数，必要时执行 --delete-range {start}:{end} 清理原块")
-    if (body_fingerprint(latest[start:end]) != body_fingerprint(current)
-            or content_signature(latest[:start]) != content_signature(prepared["children"])):
-        sys.exit(f"[otl_write] 新正文已写入 {start} 个块，原块范围有变化，旧正文尚未清理。"
-                 f"请读回确认后按需执行 --delete-range {start}:{end}")
-    try:
-        api("post", f"/v7/airpage/v2/{_wps.segment(file_id)}/blocks/delete",
-            {"block_id": "doc", "start_index": start, "end_index": end}, timeout)
-    except _wps.WpsError as exc:
-        if not exc.uncertain:
-            raise
-        progress("删除响应异常，正在回查原块")
-    try:
-        saved = doc_children(file_id, timeout)
-    except _wps.WpsError as exc:
-        sys.exit(f"[otl_write] 新正文已写入 {start} 个块，但回读失败，旧正文可能仍在文档末尾：{exc}\n"
-                 f"请稍后用 --count-blocks 确认块数，必要时执行 --delete-range {start}:{end} 清理原块")
-    original_ids = {_block_id(block) for block in current}
-    if (original_ids.intersection(_block_id(block) for block in saved)
-            or content_signature(saved[:start]) != content_signature(prepared["children"])):
-        sys.exit("[otl_write] 替换后回读不一致，请先检查云端新旧正文和备份")
-    return {**stats, "final_blocks": len(saved)}
+    return write_prepared(file_id, prepared, index=index, timeout=timeout,
+                          chunk=chunk, progress=progress)
 
 
 def report_table_widths(children: list, limit: int, progress=print) -> int:
@@ -1119,20 +1227,10 @@ def report_table_widths(children: list, limit: int, progress=print) -> int:
     """
     if limit <= 0:
         return 0
-    over = []
-    threshold = limit * (1 + TABLE_OVERFLOW_TOLERANCE)
-    for index, block in enumerate(children):
-        table = block.get("table") if isinstance(block, dict) else None
-        if not isinstance(table, dict):
-            continue
-        grid = (table.get("attributes") or {}).get("grid")
-        if isinstance(grid, list) and grid and all(isinstance(v, (int, float)) for v in grid):
-            if sum(grid) > threshold:
-                over.append((index, len(grid), int(sum(grid))))
+    over = overflowing_tables(children, limit)
     if over:
         index, columns, width = max(over, key=lambda item: item[2])
-        progress(f"表格宽度：{len(over)} 张超过 {limit}px，最宽 {width}px"
-                 f"（第 {index} 块，{columns} 列）；单元格文字多时服务端按内容保底，压不下去")
+        progress(f"表格宽度：{len(over)} 张超过 {limit}px，最宽 {width}px（第 {index} 块，{columns} 列）")
     return len(over)
 
 
@@ -1291,14 +1389,23 @@ def main() -> None:
         baseline = doc_children(args.file_id, args.timeout)
     stats = commit_document(args.file_id, prepared, mode=args.mode,
                             baseline=baseline, timeout=args.timeout, chunk=args.chunk)
-    print(f"完成：{args.mode} {stats['written']} 个块到 {args.file_id}"
-          f"（图片 {stats['images']} 张，拆表 {stats['split_tables']} 张）")
+    if args.mode == "replace":
+        print(f"完成：replace 写入 {stats['written']} 个块、删除 {stats.get('deleted', 0)} 个旧块"
+              f"到 {args.file_id}（图片 {stats['images']} 张，拆表 {stats['split_tables']} 张）")
+    else:
+        print(f"完成：{args.mode} {stats['written']} 个块到 {args.file_id}"
+              f"（图片 {stats['images']} 张，拆表 {stats['split_tables']} 张）")
 
-    if stats.get("table_reflowed") or stats.get("table_fitted") or stats.get("table_crowded"):
+    over = 0
+    if table_width > 0:
         try:
-            report_table_widths(doc_children(args.file_id, args.timeout), table_width)
+            over = report_table_widths(doc_children(args.file_id, args.timeout), table_width)
         except _wps.WpsError as exc:
             print(f"表格宽度：回读失败，未能核对实际宽度（{exc}）")
+    if over:
+        print(f"⚠️ 有 {over} 张表超过正文宽度 {table_width}px，接口无法再压：写入时每列最少 "
+              f"{TABLE_MIN_COL}px，列数一多就超出版心。请在 WPS 里手动拖窄列宽；"
+              "重跑同步时内容未变的表格不会被重写，手动调的列宽会保留。")
 
     action = ensure_title(args.file_id, title, args.timeout, overwrite=args.retitle, expected=expected_title)
     if action == "set":
