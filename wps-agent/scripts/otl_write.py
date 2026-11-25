@@ -970,12 +970,96 @@ def check_html_tables(md: str) -> None:
                  "补上表头或表体标签再写入")
 
 
+INLINE_LINK_RE = re.compile(
+    r"(?<!!)\[([^\[\]\n]*)\]\(\s*(<[^>\n]*>|[^()\s]*)(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)")
+HTML_ANCHOR_RE = re.compile(
+    r"<a\b[^>]*?\bhref\s*=\s*\"([^\"]*)\"[^>]*>(.*?)</a\s*>", re.IGNORECASE | re.DOTALL)
+LINK_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
+REF_DEF_RE = re.compile(r"^\s{0,3}\[([^\]\n]+)\]:\s*(\S+)", re.MULTILINE)
+
+
+def is_local_link(target: str) -> bool:
+    """链接目标是否指向本地文件（或页内锚点）。"""
+    text = (target or "").strip().strip("<>").strip()
+    if not text:
+        return False
+    if text.startswith("#"):
+        return True
+    if text.startswith("//"):
+        return False
+    if text.lower().startswith("file:"):
+        return True
+    if re.match(r"^[A-Za-z]:[\\/]", text):
+        return True
+    return LINK_SCHEME_RE.match(text) is None
+
+
+def _outside_code(text: str, replace) -> str:
+    """只对围栏代码块、行内代码之外的正文调用 replace。"""
+    pieces = []
+    last = 0
+    for match in FENCE_RE.finditer(text):
+        pieces.append((False, text[last:match.start()]))
+        pieces.append((True, match.group(0)))
+        last = match.end()
+    pieces.append((False, text[last:]))
+    out = []
+    for is_code, chunk in pieces:
+        if is_code:
+            out.append(chunk)
+            continue
+        parts = re.split(r"(`[^`\n]*`)", chunk)
+        out.append("".join(part if part.startswith("`") else replace(part) for part in parts))
+    return "".join(out)
+
+
+def unlink_local_links(md: str) -> tuple[str, list[str], list[str]]:
+    """把指向本地文件的链接改成纯文本。
+
+    OTL 是云端文档，`[说明](docs/a.md)`、`[示例](../src/x.yml)`、`[附录](#a)` 这类目标
+    在云端不存在，转成块之后链接照样保留但点不开。转换前摘掉链接、只留文字。
+    http/https 等外部链接原样保留，图片链接（`![alt](path)`）交给图片逻辑处理。
+    返回（新文本、已摘掉的链接目标、引用式链接定义）。
+    """
+    removed: list[str] = []
+
+    def replace_text(chunk: str) -> str:
+        def inline(match: re.Match) -> str:
+            target = match.group(2)
+            if not is_local_link(target):
+                return match.group(0)
+            removed.append(target.strip("<>"))
+            return match.group(1)
+
+        def anchor(match: re.Match) -> str:
+            target = match.group(1)
+            if not is_local_link(target):
+                return match.group(0)
+            removed.append(target)
+            return re.sub(r"<[^>]+>", "", match.group(2))
+
+        return HTML_ANCHOR_RE.sub(anchor, INLINE_LINK_RE.sub(inline, chunk))
+
+    text = _outside_code(md, replace_text)
+    refs = [match.group(2) for match in REF_DEF_RE.finditer(text)
+            if is_local_link(match.group(2))]
+    return text, removed, refs
+
+
 def prepare_markdown(file_id: str, md: str, *, base: str = ".",
                      timeout: int = 180, dry_run: bool = False,
                      images: str = "auto", img_pct: int = DEFAULT_IMG_PCT,
                      doc_width: int = DOC_WIDTH, table_width: int = DOC_WIDTH,
                      reflow: bool = True, progress=print) -> dict:
     """Prepare all blocks before editing the document body."""
+    md, unlinked, ref_links = unlink_local_links(md)
+    if unlinked:
+        sample = "、".join(unlinked[:3])
+        progress(f"本地链接：{len(unlinked)} 处指向本地文件的链接改为纯文本"
+                 f"（云端没有这些文件，链接点不开；如 {sample}）")
+    if ref_links:
+        progress(f"本地链接：{len(ref_links)} 个引用式链接定义指向本地文件"
+                 f"（如 {ref_links[0]}），未自动处理，请改成行内写法 [文字](目标)")
     check_html_tables(md)
     plan = image_plan(md, base) if images != "off" else []
     masked_md, masked = mask_heading_numbers(md)

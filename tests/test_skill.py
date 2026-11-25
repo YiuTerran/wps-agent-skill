@@ -325,6 +325,39 @@ class DocumentTests(unittest.TestCase):
         otl_write.check_html_tables("<table><tbody><tr><td>甲</td></tr></tbody></table>\n")
         otl_write.check_html_tables("```html\n<table><tr><td>示例</td></tr></table>\n```\n")
 
+    def test_airpage_unlinks_local_file_links(self):
+        md = ("见[详细设计](水利时空信息平台详细设计.md)与[脚本](../scripts/init.py)，"
+              "外部保留[标准](https://www.mwr.gov.cn/a.html)，图片![图](img/a.png)。\n"
+              "锚点[附录](#附录A)，绝对路径[配置](/etc/app.yml)，file 协议[原件](file:///tmp/a.md)。\n"
+              "<a href=\"docs/b.md\">标签链接</a>与<a href=\"https://x.cn\">远程标签</a>\n"
+              "```\n[示例](a.md)\n```\n行内示例 `[示例](b.md)`。\n")
+        text, removed, refs = otl_write.unlink_local_links(md)
+        self.assertEqual(len(removed), 6)
+        self.assertEqual(refs, [])
+        self.assertIn("见详细设计与脚本", text)
+        self.assertIn("[标准](https://www.mwr.gov.cn/a.html)", text)
+        self.assertIn("![图](img/a.png)", text)
+        self.assertIn("外部保留", text)
+        self.assertIn("标签链接", text)
+        self.assertNotIn("docs/b.md", text)
+        self.assertIn("[示例](a.md)", text)          # 围栏与行内代码不动
+        self.assertIn("`[示例](b.md)`", text)
+
+    def test_airpage_local_link_detection(self):
+        local = ("a.md", "./a.md", "../a.md", "#附录", "/abs/a.md", "file:///tmp/a.md")
+        remote = ("https://x.cn/a", "http://x.cn", "mailto:a@b.c", "//cdn.x.cn/a.js", "")
+        for target in local:
+            self.assertTrue(otl_write.is_local_link(target), target)
+        for target in remote:
+            self.assertFalse(otl_write.is_local_link(target), target)
+
+    def test_airpage_reports_reference_style_local_links(self):
+        md = "见[说明][doc]\n\n[doc]: docs/a.md\n[web]: https://x.cn\n"
+        text, removed, refs = otl_write.unlink_local_links(md)
+        self.assertEqual(removed, [])
+        self.assertEqual(refs, ["docs/a.md"])
+        self.assertIn("[doc]: docs/a.md", text)
+
     @staticmethod
     def _aria_cell(text, colspan=1, rowspan=1, extra=None):
         elements = [{"text": {"attributes": {"content": text}}}]
