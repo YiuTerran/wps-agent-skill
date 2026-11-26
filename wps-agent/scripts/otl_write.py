@@ -1120,6 +1120,75 @@ def unlink_local_links(md: str) -> tuple[str, list[str], list[str]]:
     return text, removed, refs
 
 
+BOLD_PAIR_RE = re.compile(r"(?<!\*)\*\*(?!\*)([^\n]+?)(?<!\*)\*\*(?!\*)")
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+
+
+def _is_punct(char: str) -> bool:
+    """Unicode 标点（引号、括号、书名号、逗号、句号、破折号、省略号……）。"""
+    return bool(char) and unicodedata.category(char).startswith("P")
+
+
+def _is_blank(char: str) -> bool:
+    """空白，或行首/行尾（此时传空串）。"""
+    return not char or char.isspace()
+
+
+def repair_punct_bold(md: str) -> tuple[str, list[str]]:
+    """把 `**粗体**` 换成 `<strong>`，用于两种转换不认的写法。
+
+    一是加粗紧贴中文标点：`我**“测试”**一下` 里开定界符左边是汉字、右边是引号，
+    两边都不算空白，CommonMark 判定既不能开也不能闭，星号原样留在正文里。引号、
+    括号、书名号、逗号、句号、顿号、分号、冒号、破折号、省略号、感叹号、问号、
+    英文引号全都中招；只在单侧加空格只修一半。GitHub/GitLab 渲染同样如此。
+
+    二是加粗里含行内代码：`我**`ST_CD`**一下`、`我**`HD_UNIT`（说明）**与` 这类，
+    转换对代码 run 的定界判定不可靠——外侧贴着文字时星号裸露，多对连续时还会
+    把闭合星号后面的文字一起吞进加粗。
+
+    因此：内容含反引号一律换；否则按规范的 flanking 规则，开或闭有一边不成立
+    就换。只处理单行、不含尖括号的加粗，围栏代码块与行内代码内部的星号不动。
+    返回（新文本、被改写的加粗片段）。
+    """
+    fixed: list[str] = []
+
+    def repair_chunk(chunk: str) -> str:
+        spans = [(m.start(), m.end()) for m in INLINE_CODE_RE.finditer(chunk)]
+
+        def in_code(pos: int) -> bool:
+            return any(start <= pos < end for start, end in spans)
+
+        def swap(match: re.Match) -> str:
+            if in_code(match.start()) or in_code(match.end() - 1):
+                return match.group(0)            # 星号本身就在行内代码里
+            inner = match.group(1)
+            if "<" in inner or ">" in inner:     # 已经是富文本，别二次包装
+                return match.group(0)
+            if "`" not in inner:
+                before = chunk[match.start() - 1] if match.start() else ""
+                after = chunk[match.end()] if match.end() < len(chunk) else ""
+                first, last = inner[0], inner[-1]
+                opens = not _is_blank(first) and (
+                    not _is_punct(first) or _is_blank(before) or _is_punct(before))
+                closes = not _is_blank(last) and (
+                    not _is_punct(last) or _is_blank(after) or _is_punct(after))
+                if opens and closes:
+                    return match.group(0)
+            fixed.append(inner)
+            return f"<strong>{inner}</strong>"
+
+        return BOLD_PAIR_RE.sub(swap, chunk)
+
+    pieces: list[str] = []
+    last = 0
+    for fence in FENCE_RE.finditer(md):
+        pieces.append(repair_chunk(md[last:fence.start()]))
+        pieces.append(fence.group(0))
+        last = fence.end()
+    pieces.append(repair_chunk(md[last:]))
+    return "".join(pieces), fixed
+
+
 def prepare_markdown(file_id: str, md: str, *, base: str = ".",
                      timeout: int = 180, dry_run: bool = False,
                      images: str = "auto", img_pct: int = DEFAULT_IMG_PCT,
@@ -1134,6 +1203,11 @@ def prepare_markdown(file_id: str, md: str, *, base: str = ".",
     if ref_links:
         progress(f"本地链接：{len(ref_links)} 个引用式链接定义指向本地文件"
                  f"（如 {ref_links[0]}），未自动处理，请改成行内写法 [文字](目标)")
+    md, rebolded = repair_punct_bold(md)
+    if rebolded:
+        sample = "、".join(f"**{text}**" for text in rebolded[:2])
+        progress(f"加粗：{len(rebolded)} 处 **…** 转换后不生效（紧贴标点，或内容含行内代码），"
+                 f"已改用 <strong>（{sample}）；源文件里也建议直接写 <strong>")
     check_html_tables(md)
     plan = image_plan(md, base) if images != "off" else []
     masked_md, masked = mask_heading_numbers(md)
@@ -1225,6 +1299,23 @@ def _signature_text(text: str) -> str:
     return text.replace("\xa0", " ")
 
 
+SEMANTIC_STYLES = ("bold", "italic", "strike", "code")
+
+
+def _style_marks(style) -> tuple:
+    """只取会改变语义的样式，忽略字号、字体、颜色等排版细节。"""
+    if not isinstance(style, dict):
+        return ()
+    marks = []
+    for key in SEMANTIC_STYLES:
+        if style.get(key):
+            marks.append(key)
+    link = style.get("link")
+    if isinstance(link, dict) and link.get("href"):
+        marks.append(("link", link["href"]))
+    return tuple(marks)
+
+
 def content_signature(block):
     """Compare visible content across the conversion and persisted block schemas."""
     if isinstance(block, list):
@@ -1241,8 +1332,12 @@ def content_signature(block):
     if not isinstance(block, dict):
         return ()
     if "text" in block and isinstance(block["text"], dict):
-        content = (block["text"].get("attributes") or {}).get("content", "")
-        return _signature_text(content) if isinstance(content, str) else content
+        node = block["text"]
+        content = (node.get("attributes") or {}).get("content", "")
+        text = _signature_text(content) if isinstance(content, str) else content
+        # 样式也算内容：`**` 紧密贴标点时星号会被吞掉，只比对文字就看不出「加粗跑偏」
+        marks = _style_marks(node.get("style"))
+        return (text, marks) if marks else text
     parts = []
     for key, value in sorted(block.items()):
         if key in {"block_id", "attributes", "range_marks"}:

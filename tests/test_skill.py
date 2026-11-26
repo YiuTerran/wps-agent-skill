@@ -379,6 +379,41 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(refs, ["docs/a.md"])
         self.assertIn("[doc]: docs/a.md", text)
 
+    def test_airpage_bold_next_to_cjk_punct_becomes_strong(self):
+        # `我**“测试”**一下` 两边都贴着汉字，** 既不能开也不能闭，星号会裸露
+        md = ("我**“测试”**一下，只加闭合侧空格**“这样”** 仍无效，"
+              "英文引号**\"x\"**同样不行，括号**测试（一）**也中招。\n")
+        text, fixed = otl_write.repair_punct_bold(md)
+        self.assertEqual(len(fixed), 4)
+        self.assertIn("我<strong>“测试”</strong>一下", text)
+        self.assertIn("<strong>“这样”</strong>", text)
+        self.assertIn('<strong>"x"</strong>', text)
+        self.assertIn("<strong>测试（一）</strong>", text)
+        self.assertNotIn("**", text)
+
+    def test_airpage_keeps_valid_bold_boundaries(self):
+        md = ("普通**加粗**不变，两侧留空格 **“测试”** 也不变，"
+              "独立成段：\n\n**“单独”**\n\n两侧是标点：（**“包裹”**）\n")
+        text, fixed = otl_write.repair_punct_bold(md)
+        self.assertEqual(fixed, [])
+        self.assertEqual(text, md)
+
+    def test_airpage_bold_with_inline_code_becomes_strong(self):
+        # 加粗里含行内代码时，转换对代码 run 的定界判定不可靠：贴着文字就裸露星号，
+        # 连续多对时还会把闭合星号后的「与」吞进加粗
+        md = ("我**`X`**一下，目录**`HD_UNIT`（说明）**与**`ST_INSTCD_B`（只读）**：\n")
+        text, fixed = otl_write.repair_punct_bold(md)
+        self.assertEqual(len(fixed), 3)
+        self.assertIn("我<strong>`X`</strong>一下", text)
+        self.assertIn("<strong>`HD_UNIT`（说明）</strong>与<strong>`ST_INSTCD_B`（只读）</strong>", text)
+        self.assertNotIn("**", text)
+
+    def test_airpage_leaves_bold_inside_code(self):
+        md = ("```md\n我**“示例”**一下\n```\n行内 `我**“示例”**一下` 不动。\n")
+        text, fixed = otl_write.repair_punct_bold(md)
+        self.assertEqual(fixed, [])
+        self.assertEqual(text, md)
+
     @staticmethod
     def _aria_cell(text, colspan=1, rowspan=1, extra=None):
         elements = [{"text": {"attributes": {"content": text}}}]
