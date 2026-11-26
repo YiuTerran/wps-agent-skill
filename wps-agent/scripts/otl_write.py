@@ -685,8 +685,80 @@ def _split_text(text: str, limit: int) -> list[str]:
     return pieces
 
 
+def _text_element(content: str, style: dict | None) -> dict:
+    text = {"attributes": {"content": content}}
+    if style:
+        text["style"] = style
+    return {"text": text}
+
+
+def _text_runs(paragraph: dict) -> list[tuple[str, dict | None]] | None:
+    """段落的（文字, 样式）序列；含公式、图片等非文本元素时返回 None。"""
+    runs = []
+    for element in paragraph.get("elements") or []:
+        text = element.get("text") if isinstance(element, dict) else None
+        if not isinstance(text, dict):
+            return None
+        content = (text.get("attributes") or {}).get("content")
+        if not isinstance(content, str):
+            return None
+        runs.append((content, text.get("style")))
+    return runs
+
+
+def _split_runs(runs: list[tuple[str, dict | None]],
+                limit: int) -> list[list[tuple[str, dict | None]]]:
+    """按字数切分带样式的文字，返回每行的（文字, 样式）序列。
+
+    与 `_split_text` 的区别是保留行内样式：字段名常是行内代码，单元格里混排正文和
+    代码时整段不切会把列撑得很宽。标识符按不可断词整体处理，不会从中间断开。
+    """
+    atoms = [(atom, index) for index, (content, _) in enumerate(runs)
+             for atom in _atoms(content)]
+    lines: list[list[tuple[str, int]]] = []
+    line: list[tuple[str, int]] = []
+    size = 0
+    for atom, index in atoms:
+        if line and size + len(atom) > limit:
+            lines.append(line)
+            line, size = [], 0
+        if not line and atom.isspace():
+            continue                            # 行首不留空白
+        line.append((atom, index))
+        size += len(atom)
+    if line:
+        lines.append(line)
+    return [[(atom, runs[index][1]) for atom, index in line] for line in lines]
+
+
+def _paragraph_with_runs(paragraph: dict, runs: list[tuple[str, dict | None]]) -> dict:
+    """用切好的（文字, 样式）序列生成段落块，样式相同的连续文字合成一个元素。"""
+    elements = []
+    buffer = ""
+    style = None
+    started = False
+    for atom, current in runs:
+        if not started:
+            style, started = current, True
+        elif current != style:
+            elements.append(_text_element(buffer, style))
+            buffer, style = "", current
+        buffer += atom
+    if buffer:
+        elements.append(_text_element(buffer, style))
+    clone = json.loads(json.dumps(paragraph, ensure_ascii=False))
+    clone["elements"] = elements
+    clone.pop("block_id", None)
+    clone.pop("range_marks", None)
+    return {"paragraph": clone}
+
+
 def _reflow_cell(cell: dict, limit: int) -> bool:
-    """把单元格里超过 limit 字的段落拆成多段，相当于手动拖窄列后的换行。"""
+    """把单元格里超过 limit 字的段落拆成多段，相当于手动拖窄列后的换行。
+
+    行内代码、加粗这类样式随切分一起保留：字段清单表里「正文＋字段名」混排的单元格
+    很常见，整段不切会把列宽顶到几百像素，表格就压不回版心。
+    """
     changed = False
     out = []
     for child in cell.get("children") or []:
@@ -695,17 +767,19 @@ def _reflow_cell(cell: dict, limit: int) -> bool:
             out.append(child)
             continue
         text = _paragraph_text(paragraph)
-        elements = paragraph.get("elements") or []
-        # 只处理纯文本段落：多元素的有行内样式，按字符重组会丢掉样式边界
-        if len(text) <= limit or len(elements) != 1:
+        if len(text) <= limit:
             out.append(child)
             continue
-        for piece in _split_text(text, limit):
-            clone = json.loads(json.dumps(paragraph, ensure_ascii=False))
-            clone["elements"] = [{"text": {"attributes": {"content": piece}}}]
-            clone.pop("block_id", None)
-            clone.pop("range_marks", None)
-            out.append({"paragraph": clone})
+        runs = _text_runs(paragraph)
+        if runs is None:                        # 公式、图片等非文本元素不切
+            out.append(child)
+            continue
+        if len(runs) == 1:
+            for piece in _split_text(text, limit):
+                out.append(_paragraph_with_runs(paragraph, [(piece, runs[0][1])]))
+        else:
+            for line in _split_runs(runs, limit):
+                out.append(_paragraph_with_runs(paragraph, line))
         changed = True
     if changed:
         cell["children"] = out
@@ -1142,6 +1216,15 @@ def body_fingerprint(children: list) -> str:
     return hashlib.sha256(json.dumps(children, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def _signature_text(text: str) -> str:
+    """签名用的文本归一化。
+
+    convert 返回的代码块缩进是 `\\xa0 \\xa0 `（不换行空格夹空格），写回后服务端
+    存成等量的普通空格；不归一化会把同一段代码判成「内容变了」，替换时反复重建。
+    """
+    return text.replace("\xa0", " ")
+
+
 def content_signature(block):
     """Compare visible content across the conversion and persisted block schemas."""
     if isinstance(block, list):
@@ -1158,7 +1241,8 @@ def content_signature(block):
     if not isinstance(block, dict):
         return ()
     if "text" in block and isinstance(block["text"], dict):
-        return (block["text"].get("attributes") or {}).get("content", "")
+        content = (block["text"].get("attributes") or {}).get("content", "")
+        return _signature_text(content) if isinstance(content, str) else content
     parts = []
     for key, value in sorted(block.items()):
         if key in {"block_id", "attributes", "range_marks"}:

@@ -128,6 +128,9 @@ def _decode_body(response) -> bytes:
 
 def _transient(exc: "WpsError") -> bool:
     """读请求是否值得重试：网络中断、超时、响应截断或网关临时错误。"""
+    if "响应无法解析" in (exc.kind or "") or "响应应为 JSON" in (exc.kind or ""):
+        # 大块树偶尔返回 HTTP 200 但正文被截断，重读通常就好
+        return True
     return exc.status is None or exc.status in {408, 425, 429, 500, 502, 503, 504}
 
 

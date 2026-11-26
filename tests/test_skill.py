@@ -174,14 +174,35 @@ class ClientTests(unittest.TestCase):
                              {"blocks": []})
 
     def test_truncated_gzip_body_still_reports_unparseable(self):
-        response = io.BytesIO(b"\x1f\x8b\x08\x00broken")
-        response.status = 200
-        response.headers = Message()
-        response.headers["Content-Encoding"] = "gzip"
-        self.opener.open.side_effect = [auth_response(), response]
-        with patch.dict(os.environ, {"AGENT_API_KEY": "test-key"}):
+        def truncated():
+            response = io.BytesIO(b"\x1f\x8b\x08\x00broken")
+            response.status = 200
+            response.headers = Message()
+            response.headers["Content-Encoding"] = "gzip"
+            return response
+
+        self.opener.open.side_effect = [auth_response()] + [truncated() for _ in range(3)]
+        with (patch.dict(os.environ, {"AGENT_API_KEY": "test-key"}),
+              patch.object(_wps.time, "sleep")):
             with self.assertRaisesRegex(_wps.WpsError, "响应无法解析"):
                 self.client.api("GET", "/v7/airpage/v2/doc/blocks")
+        self.assertEqual(self.opener.open.call_count, 4)
+
+    def test_truncated_read_body_is_retried(self):
+        def truncated():
+            response = io.BytesIO(b"\x1f\x8b\x08\x00broken")
+            response.status = 200
+            response.headers = Message()
+            response.headers["Content-Encoding"] = "gzip"
+            return response
+
+        # HTTP 200 但正文被截断：状态码正常，仍要按瞬态错误重读
+        self.opener.open.side_effect = [auth_response(), truncated(),
+                                        api_response({"ok": True})]
+        with (patch.dict(os.environ, {"AGENT_API_KEY": "test-key"}),
+              patch.object(_wps.time, "sleep")):
+            self.assertEqual(self.client.api("GET", "/v7/airpage/v2/doc/blocks"), {"ok": True})
+        self.assertEqual(self.opener.open.call_count, 3)
 
     def test_transient_read_failure_is_retried_but_write_is_not(self):
         with (patch.dict(os.environ, {"AGENT_API_KEY": "test-key"}),
@@ -479,13 +500,26 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(otl_write.reflow_tables([table], 740), 0)
         self.assertEqual(table["table"]["attributes"]["grid"], [380, 380])
 
-    def test_airpage_reflow_leaves_rich_text_cells(self):
-        cell = self._aria_cell("测站名称" * 10, extra="（加粗）")
+    def test_airpage_reflow_splits_rich_text_cells_keeping_style(self):
+        plain = {"text": {"attributes": {"content": "测站名称" * 10}}}
+        bold = {"text": {"attributes": {"content": "（加粗）"}, "style": {"bold": True}}}
+        cell = {"attributes": {"colspan": 1, "rowspan": 1}, "children": [
+            {"paragraph": {"attributes": {"align": "left"}, "elements": [plain, bold]}}]}
         table = {"table": {"attributes": {"grid": [500, 500]}, "rows": [
             {"cells": [self._aria_cell("说明"), self._aria_cell("备注")]},
             {"cells": [self._aria_cell("测站名称" * 10), cell]}]}}
         otl_write.reflow_tables([table], 740)
-        self.assertEqual(len(cell["children"]), 1)
+        self.assertGreater(len(cell["children"]), 1)
+        pieces = []
+        bolded = []
+        for child in cell["children"]:
+            for element in child["paragraph"]["elements"]:
+                content = element["text"]["attributes"]["content"]
+                pieces.append(content)
+                if (element["text"].get("style") or {}).get("bold"):
+                    bolded.append(content)
+        self.assertEqual("".join(pieces), "测站名称" * 10 + "（加粗）")
+        self.assertEqual("".join(bolded), "（加粗）")   # 行内样式跟着文字走，不丢
 
     def test_airpage_table_width_zero_keeps_grid(self):
         block = {"table": {"attributes": {"grid": [800, 800]}, "rows": [{"cells": []}]}}
